@@ -1,0 +1,58 @@
+# Drei Hostnamen, drei Aufgaben. Caddy holt und erneuert die Zertifikate selbst.
+#
+# Bewusst ohne globale `email`-Direktive: Let's Encrypt braucht keine Adresse,
+# und eine leere wäre ein Syntaxfehler statt eines Standardwerts. Wer
+# Ablaufwarnungen per Mail will, fügt hier einen Block ein:
+#
+#     {
+#         email name@example.com
+#     }
+
+# --- Öffentliche Ansicht: Menschen schauen zu ------------------------------
+{$PUBLIC_HOST} {
+	encode zstd gzip
+
+	# Blobs direkt von der Platte, ohne die App anzufassen. Content-addressed,
+	# also kann sich unter einer URL nie etwas ändern - `immutable` ist korrekt.
+	handle_path /b/* {
+		root * /srv/blobs
+		file_server
+		header Cache-Control "public, max-age=31536000, immutable"
+	}
+
+	reverse_proxy app:8000
+}
+
+# --- MCP: der Resource Server ----------------------------------------------
+{$MCP_HOST} {
+	encode zstd gzip
+
+	# Die harte Größengrenze zieht der Proxy, nicht die App: ein 500-MB-Upload
+	# soll sterben, bevor er einen App-Prozess belegt.
+	request_body {
+		max_size 10MB
+	}
+
+	reverse_proxy app:8000
+}
+
+# --- Authorization Server: Hydra und die Login-App -------------------------
+{$AUTH_HOST} {
+	encode zstd gzip
+
+	# Alles, was zum OAuth-Protokoll gehört, beantwortet Hydra selbst.
+	handle /oauth2/* {
+		reverse_proxy hydra:4444
+	}
+	handle /.well-known/* {
+		reverse_proxy hydra:4444
+	}
+	handle /userinfo {
+		reverse_proxy hydra:4444
+	}
+
+	# Login, Consent und der GitHub-Rückweg sind unsere eigene App.
+	handle {
+		reverse_proxy login:3000
+	}
+}

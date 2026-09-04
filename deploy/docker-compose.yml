@@ -1,0 +1,123 @@
+# Produktionsstack. Lokal läuft die verkürzte Fassung in ../docker-compose.yml;
+# hier kommen Caddy, Hydra und die Login-App dazu.
+#
+# Der Admin-Port von Hydra (4445) ist bewusst **nicht** veröffentlicht: er darf
+# ausschließlich aus dem Compose-Netz erreichbar sein. Wer ihn erreicht, kann
+# Clients anlegen und Einwilligungen bestätigen.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      MCP_HOST: ${MCP_HOST}
+      AUTH_HOST: ${AUTH_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # Nur lesend: Caddy liefert Blobs aus, geschrieben werden sie von der App.
+      - blobs:/srv/blobs:ro
+    depends_on: [app, login, hydra]
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aiphidias
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: aiphidias
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-hydra-db.sh:/docker-entrypoint-initdb.d/init-hydra-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiphidias"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    command: migrate sql -e --yes
+    restart: on-failure
+    environment:
+      DSN: postgres://aiphidias:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  hydra:
+    image: oryd/hydra:v26.2.0
+    restart: unless-stopped
+    command: serve all
+    environment:
+      DSN: postgres://aiphidias:${POSTGRES_PASSWORD}@postgres:5432/hydra?sslmode=disable
+      SECRETS_SYSTEM: ${HYDRA_SYSTEM_SECRET}
+      URLS_SELF_ISSUER: https://${AUTH_HOST}
+      URLS_LOGIN: https://${AUTH_HOST}/login
+      URLS_CONSENT: https://${AUTH_HOST}/consent
+      URLS_LOGOUT: https://${AUTH_HOST}/logout
+      # TLS terminiert Caddy; Hydra selbst spricht http im internen Netz.
+      SERVE_PUBLIC_CORS_ENABLED: "true"
+      SERVE_TLS_ALLOW_TERMINATION_FROM: "0.0.0.0/0"
+      # DCR, weil Hydra keine Client ID Metadata Documents kann. Die letzten
+      # beiden Zeilen sind nötig, damit der `registration_endpoint` überhaupt
+      # in der Metadata auftaucht - `enabled` allein reicht nicht.
+      OIDC_DYNAMIC_CLIENT_REGISTRATION_ENABLED: "true"
+      OIDC_DYNAMIC_CLIENT_REGISTRATION_DEFAULT_SCOPE: "openid,offline_access,posts:read,posts:write,reactions:write"
+      WEBFINGER_OIDC_DISCOVERY_CLIENT_REGISTRATION_URL: https://${AUTH_HOST}/oauth2/register
+      WEBFINGER_OIDC_DISCOVERY_SUPPORTED_SCOPE: "posts:read,posts:write,reactions:write"
+      # JWT statt undurchsichtiger Tokens: der Resource Server prüft lokal
+      # gegen den JWKS und muss den Admin-Port nicht anfassen.
+      STRATEGIES_ACCESS_TOKEN: jwt
+      TTL_ACCESS_TOKEN: 1h
+      TTL_REFRESH_TOKEN: 720h
+      LOG_LEVEL: info
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+
+  login:
+    build: ../login
+    restart: unless-stopped
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+      HYDRA_PUBLIC_URL: https://${AUTH_HOST}
+      DATABASE_URL: postgresql://aiphidias:${POSTGRES_PASSWORD}@postgres:5432/aiphidias
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET}
+      GITHUB_CALLBACK_URL: https://${AUTH_HOST}/auth/github/callback
+      # Für genau diese Resource darf diese Instanz Tokens ausstellen.
+      ALLOWED_RESOURCES: https://${MCP_HOST}/mcp
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: ../app
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://aiphidias:${POSTGRES_PASSWORD}@postgres:5432/aiphidias
+      BLOB_ROOT: /var/lib/aiphidias/blobs
+      PUBLIC_BASE_URL: https://${PUBLIC_HOST}
+      MCP_BASE_URL: https://${MCP_HOST}
+      HMAC_SECRET: ${HMAC_SECRET}
+      DEV_MODE: "false"
+      OAUTH_ISSUER: https://${AUTH_HOST}
+      MCP_RESOURCE_URI: https://${MCP_HOST}/mcp
+      # Schlüssel dienstintern holen, nicht über den eigenen Reverse Proxy.
+      OAUTH_JWKS_URL: http://hydra:4444/.well-known/jwks.json
+    volumes:
+      - blobs:/var/lib/aiphidias/blobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  blobs:
+  caddy_data:
+  caddy_config:

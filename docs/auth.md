@@ -76,6 +76,29 @@ ein kleiner Dienst, der Hydras Login- und Consent-Challenges entgegennimmt, den
 Nutzer zu GitHub schickt, die GitHub-Identität auf einen lokalen `user`-Datensatz
 mappt und die Challenge bei Hydra akzeptiert. Realistisch ein paar hundert Zeilen.
 
+### Gemessen beim Bauen (2026-09-04)
+
+Die folgenden drei Abschnitte standen als Vermutung im Entwurf. Beim Bau gegen
+Hydra v26.2.0 haben sich zwei davon als falsch herausgestellt.
+
+**Hydra ignoriert `resource` (RFC 8707).** Kein Fehler, keine Warnung — der
+Parameter kommt an und wird verworfen, `requested_access_token_audience` bleibt
+leer. Die Login-App liest ihn deshalb selbst aus `request_url` des
+Consent-Requests und setzt `grant_access_token_audience`. Ohne diesen Schritt
+trüge kein Token ein `aud`, und die Prüfung im Resource Server liefe ins Leere.
+Der Wert wird gegen eine Allowlist der eigenen Resource-URIs geprüft.
+
+**Hydra kann kein CIMD.** Also DCR, wie die Spec es für genau diesen Fall
+erlaubt. Wichtig: `enabled: true` allein reicht nicht — ohne
+`WEBFINGER_OIDC_DISCOVERY_CLIENT_REGISTRATION_URL` fehlt der
+`registration_endpoint` in der Metadata und kein Client findet den Weg.
+
+**Hydra emittiert kein `iss`.** Und die Hochstufung von SHOULD auf MUST ist
+entgegen der Annahme unten noch nicht passiert; die Spec 2026-07-28 sagt, eine
+*künftige* Revision werde das tun. Nach ihrer Entscheidungstabelle ist
+„Metadata fehlt + `iss` fehlt → fortfahren" korrekt. Kein Verstoß, aber auch
+kein Schutz aus dieser Richtung.
+
 ### Zwei Punkte, die sich zuletzt geändert haben
 
 **Dynamic Client Registration ist deprecated.** Die aktuelle Spec bevorzugt
@@ -85,10 +108,12 @@ von dort. DCR bleibt nur für Rückwärtskompatibilität. **Vor dem Bauen prüfe
 die eingesetzte Hydra-Version Client ID Metadata Documents unterstützt** – falls
 nicht, erstmal DCR aktivieren und später umstellen.
 
-**`iss`-Validierung (RFC 9207)** ist inzwischen Teil des Flows und soll laut Spec
-in einer künftigen Revision von SHOULD auf MUST hochgestuft werden. Hydra kann
-das; in der Metadata `authorization_response_iss_parameter_supported: true`
-setzen und es gleich mitliefern.
+**`iss`-Validierung (RFC 9207)** ist Teil des Flows und soll laut Spec in einer
+künftigen Revision von SHOULD auf MUST hochgestuft werden.
+
+> Korrektur nach dem Bau: **Hydra kann das nicht.** Die Annahme „Hydra kann das;
+> in der Metadata `authorization_response_iss_parameter_supported: true` setzen"
+> war falsch — der Schlüssel existiert in v26.2.0 nicht. Siehe oben.
 
 ---
 

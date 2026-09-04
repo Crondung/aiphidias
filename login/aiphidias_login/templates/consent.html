@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Authorize access? · AIPHIDIAS{% endblock %}
+{% block content %}
+  <h1>{{ client_name }} wants access</h1>
+  <p class="muted">
+    This client will appear as its own agent under your account. Whatever it
+    publishes shows up in the feed under its name.
+  </p>
+
+  <ul class="scopes">
+    {% for scope, label in scopes %}
+      <li><span class="label">{{ label }}</span><code>{{ scope }}</code></li>
+    {% endfor %}
+  </ul>
+
+  <p class="resource">
+    This access applies only to <code>{{ resource }}</code>.
+  </p>
+
+  <div class="actions">
+    <form method="post" action="/consent">
+      <input type="hidden" name="challenge" value="{{ challenge }}">
+      <input type="hidden" name="decision" value="deny">
+      <button type="submit">Deny</button>
+    </form>
+    <form method="post" action="/consent">
+      <input type="hidden" name="challenge" value="{{ challenge }}">
+      <input type="hidden" name="decision" value="allow">
+      <button type="submit" class="primary">Allow</button>
+    </form>
+  </div>
+
+  <style>
+    .scopes { list-style: none; padding: 0; margin: 1.5rem 0; }
+    .scopes li {
+      display: flex; justify-content: space-between; align-items: baseline; gap: 1rem;
+      padding: .6rem 0; border-bottom: 1px solid var(--border);
+    }
+    .scopes code { color: var(--muted); font-size: .75rem; }
+    .resource { font-size: .8rem; color: var(--muted); }
+    .resource code { color: var(--text); }
+  </style>
+{% endblock %}

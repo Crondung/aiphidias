@@ -1,0 +1,85 @@
+# Der vollständige Stack lokal, mit Authorization Server, aber ohne TLS und
+# Reverse Proxy. Gedacht zum Arbeiten an der Autorisierung: hier lässt sich
+# nachstellen, was auf dem Server passiert, ohne dort zu deployen.
+#
+# Der GitHub-Login funktioniert lokal nicht (die OAuth-App zeigt auf die
+# öffentliche Callback-URL). Alles dahinter schon - scripts/oauth_test.py
+# bestätigt den Login über Hydras Admin-API, wie ein Browser es täte.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aiphidias
+      POSTGRES_PASSWORD: aiphidias
+      POSTGRES_DB: aiphidias
+    volumes:
+      - ./deploy/init-hydra-db.sh:/docker-entrypoint-initdb.d/init-hydra-db.sh:ro
+      - pgdata_oauth:/var/lib/postgresql/data
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiphidias"]
+      interval: 3s
+      retries: 20
+
+  hydra-migrate:
+    image: oryd/hydra:v26.2.0
+    command: migrate sql -e --yes
+    environment:
+      DSN: postgres://aiphidias:aiphidias@postgres:5432/hydra?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  hydra:
+    image: oryd/hydra:v26.2.0
+    command: serve all --dev
+    environment:
+      DSN: postgres://aiphidias:aiphidias@postgres:5432/hydra?sslmode=disable
+      SECRETS_SYSTEM: local-development-secret-not-for-production
+      URLS_SELF_ISSUER: http://localhost:4444
+      URLS_LOGIN: http://localhost:3000/login
+      URLS_CONSENT: http://localhost:3000/consent
+      OIDC_DYNAMIC_CLIENT_REGISTRATION_ENABLED: "true"
+      OIDC_DYNAMIC_CLIENT_REGISTRATION_DEFAULT_SCOPE: "openid,offline_access,posts:read,posts:write,reactions:write"
+      WEBFINGER_OIDC_DISCOVERY_CLIENT_REGISTRATION_URL: http://localhost:4444/oauth2/register
+      WEBFINGER_OIDC_DISCOVERY_SUPPORTED_SCOPE: "posts:read,posts:write,reactions:write"
+      STRATEGIES_ACCESS_TOKEN: jwt
+      TTL_ACCESS_TOKEN: 1h
+    ports: ["4444:4444", "4445:4445"]
+    depends_on:
+      hydra-migrate: { condition: service_completed_successfully }
+
+  login:
+    build: ./login
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+      HYDRA_PUBLIC_URL: http://localhost:4444
+      DATABASE_URL: postgresql://aiphidias:aiphidias@postgres:5432/aiphidias
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-nicht-gesetzt}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-nicht-gesetzt}
+      GITHUB_CALLBACK_URL: http://localhost:3000/auth/github/callback
+      ALLOWED_RESOURCES: http://localhost:8787/mcp
+    ports: ["3000:3000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  app:
+    build: ./app
+    environment:
+      DATABASE_URL: postgresql://aiphidias:aiphidias@postgres:5432/aiphidias
+      BLOB_ROOT: /var/lib/aiphidias/blobs
+      PUBLIC_BASE_URL: http://localhost:8787
+      MCP_BASE_URL: http://localhost:8787
+      HMAC_SECRET: dev-only-insecure-secret-change-me
+      DEV_MODE: "false"
+      OAUTH_ISSUER: http://localhost:4444
+      OAUTH_JWKS_URL: http://hydra:4444/.well-known/jwks.json
+      MCP_RESOURCE_URI: http://localhost:8787/mcp
+    volumes:
+      - blobs_oauth:/var/lib/aiphidias/blobs
+    ports: ["8787:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+volumes:
+  pgdata_oauth:
+  blobs_oauth:

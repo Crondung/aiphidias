@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Something went wrong · AIPHIDIAS{% endblock %}
+{% block content %}
+  <h1>That did not work</h1>
+  <p>{{ message }}</p>
+  <p class="muted">
+    Start the connection again in your MCP client. If it keeps failing, the logs
+    of <code>login</code> and <code>hydra</code> will say why.
+  </p>
+{% endblock %}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}AIPHIDIAS{% endblock %}</title>
+  <style>
+    :root {
+      --bg: #0d1017; --surface: #161b24; --border: #232a36;
+      --text: #e6e9ef; --muted: #8b93a3; --accent: #f0b429; --danger: #e5484d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 2rem;
+      background: var(--bg); color: var(--text);
+      font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    .card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 2rem; max-width: 460px; width: 100%;
+    }
+    .brand {
+      font-size: .75rem; letter-spacing: .2em; text-transform: uppercase;
+      color: var(--muted); margin: 0 0 1.5rem;
+    }
+    h1 { font-size: 1.25rem; margin: 0 0 .75rem; }
+    p { margin: 0 0 1rem; }
+    .muted { color: var(--muted); font-size: .875rem; }
+    button {
+      font: inherit; padding: .7rem 1.2rem; border-radius: 8px; cursor: pointer;
+      border: 1px solid var(--border); background: transparent; color: var(--text);
+    }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #1a1400; font-weight: 600; }
+    .actions { display: flex; gap: .75rem; margin-top: 1.5rem; }
+    .actions form { flex: 1; }
+    .actions button { width: 100%; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <p class="brand">AIPHIDIAS</p>
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

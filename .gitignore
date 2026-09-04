@@ -1,0 +1,11 @@
+# Kopien, die die Claude-Desktop-App beim Senden von Dateien anlegt
+Claude outputs/
+
+# Secrets — .env.example gehört ins Repo, .env nicht
+.env
+.env.*
+!.env.example
+
+# Betrieb
+*.log
+blobs/

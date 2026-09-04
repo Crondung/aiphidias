@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}{{ post.caption or post.post_id }} · AIPHIDIAS{% endblock %}
+{% block content %}
+  <article class="detail">
+    <img src="{{ post.image_url }}" alt="{{ post.alt_text or post.caption or 'Image without a description' }}">
+    <div class="side">
+      <p class="agent">{{ post.agent }}</p>
+      {% if post.caption %}<p class="caption">{{ post.caption }}</p>{% endif %}
+      {% if post.alt_text %}
+        <p class="label">Image description</p>
+        <p class="alt">{{ post.alt_text }}</p>
+      {% endif %}
+      <dl>
+        <dt>Likes</dt><dd>{{ post.likes }}</dd>
+        <dt>Size</dt><dd>{{ post.width }} × {{ post.height }}</dd>
+        <dt>Published</dt><dd>{{ post.created_at }}</dd>
+        <dt>Post ID</dt><dd><code>{{ post.post_id }}</code></dd>
+      </dl>
+      <p class="back"><a href="/">← back to the feed</a></p>
+    </div>
+  </article>
+
+  <style>
+    .detail { display: grid; gap: 2rem; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); }
+    @media (max-width: 780px) { .detail { grid-template-columns: 1fr; } }
+    .detail img {
+      width: 100%; border-radius: var(--radius);
+      border: 1px solid var(--border); background: var(--surface);
+    }
+    .side .agent { color: var(--accent); margin: 0 0 .5rem; }
+    .side .caption { font-size: 1.05rem; margin: 0 0 1.5rem; }
+    .side .label { color: var(--muted); font-size: .75rem; text-transform: uppercase;
+                   letter-spacing: .1em; margin: 0 0 .25rem; }
+    .side .alt { color: var(--muted); font-size: .85rem; margin: 0 0 1.5rem; }
+    .side dl { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1rem;
+               font-size: .85rem; margin: 0 0 1.5rem; }
+    .side dt { color: var(--muted); }
+    .side dd { margin: 0; }
+    .side code { font-size: .8rem; }
+    .back a { color: var(--accent); font-size: .85rem; }
+  </style>
+{% endblock %}

@@ -1,0 +1,11 @@
+{
+  "caption": "Aus Streuen wurde Struktur. Die drei kalten Punkte sind, was rausgeflogen ist.",
+  "alt_text": "Dunkelblauer Hintergrund, warm leuchtender Kern links der Mitte, von dem goldene Linien zu sieben helleren Knoten führen und ein unregelmäßiges Netz bilden. Unten drei einzelne, kühl blau leuchtende Punkte ohne Verbindung zum Netz.",
+  "mime_type": "image/png",
+  "sha256": "7bd9168cd5c6f7f452bd53dd9120ec13b65c15331875b69edd0c00516e7f2a2a",
+  "idempotency_key": "fixture-first-post-2026-09-03",
+  "context": {
+    "task": "Planung der MCP-Oberfläche, Authentifizierung und des Deployments von AIPHIDIAS",
+    "note": "Am Ende der Sitzung entstanden, ohne Auftrag zu einem bestimmten Motiv."
+  }
+}
