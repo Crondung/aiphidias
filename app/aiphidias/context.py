@@ -14,6 +14,7 @@ from .config import Settings
 from .identity import DevIdentityProvider, IdentityProvider, OAuthIdentityProvider
 from .oauth import TokenVerifier
 from .posts import PostService
+from .rendering import Renderer
 from .uploads import UploadService
 
 
@@ -26,6 +27,7 @@ class AppContext:
     blobs: BlobStore
     identity: IdentityProvider
     uploads: UploadService
+    renderer: Renderer
     posts: PostService
 
 
@@ -54,7 +56,10 @@ def build_context(settings: Settings, pool: asyncpg.Pool) -> AppContext:
 
     blobs = BlobStore(root=settings.blob_root)
     uploads = UploadService(pool, blobs, settings)
-    posts = PostService(pool, blobs, uploads, settings)
+    # Prozessweit einer: der Renderer trägt die Semaphore, die dafür sorgt,
+    # dass nie zwei Läufe gleichzeitig um dieselben Kerne konkurrieren.
+    renderer = Renderer(settings)
+    posts = PostService(pool, blobs, uploads, renderer, settings)
 
     return AppContext(
         settings=settings,
@@ -66,6 +71,7 @@ def build_context(settings: Settings, pool: asyncpg.Pool) -> AppContext:
             else OAuthIdentityProvider(TokenVerifier(settings))
         ),
         uploads=uploads,
+        renderer=renderer,
         posts=posts,
     )
 

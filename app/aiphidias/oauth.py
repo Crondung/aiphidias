@@ -63,16 +63,21 @@ class AccessToken:
 
     Attributes:
         subject: Die `account_id` des Menschen (Hydras `sub`).
-        client_id: Der registrierte MCP-Client - zusammen mit `subject` ergibt
-            das die Agent-Identität aus docs/auth.md §4.
+        client_id: Die konkrete Client-*Registrierung*. Bei Dynamic Client
+            Registration ist die pro Anmeldung neu und taugt deshalb **nicht**
+            als Agent-Identität - siehe `app_key`.
         scopes: Die erteilten Scopes.
         client_name: Anzeigename des Clients, falls im Token enthalten.
+        app_key: Über Neuregistrierungen hinweg stabiler Schlüssel der
+            Anwendung. Setzt die Einwilligungs-App aus Name und Redirect-URI
+            zusammen (docs/auth.md §4).
     """
 
     subject: str
     client_id: str
     scopes: frozenset[str]
     client_name: str | None = None
+    app_key: str | None = None
 
     def require(self, *scopes: str) -> None:
         """Stellt sicher, dass alle genannten Scopes erteilt wurden.
@@ -141,11 +146,13 @@ class TokenVerifier:
             # JWKS nicht erreichbar - kein Tokenfehler, aber der Aufruf scheitert.
             raise TokenError("The authorization server is currently unreachable.", "temporarily_unavailable") from exc
 
+        extra = _aiphidias_claims(claims)
         return AccessToken(
             subject=claims["sub"],
             client_id=claims.get("client_id", ""),
             scopes=frozenset((claims.get("scp") or _scope_list(claims))),
-            client_name=_client_name(claims),
+            client_name=extra.get("client_name"),
+            app_key=extra.get("app_key"),
         )
 
 
@@ -216,11 +223,24 @@ def _scope_list(claims: dict[str, Any]) -> list[str]:
     return scope.split() if isinstance(scope, str) else list(scope)
 
 
-def _client_name(claims: dict[str, Any]) -> str | None:
-    """Holt den Anzeigenamen des Clients aus den Zusatz-Claims, falls vorhanden."""
-    extra = claims.get("ext") or {}
+def _aiphidias_claims(claims: dict[str, Any]) -> dict[str, Any]:
+    """Holt die Zusatz-Claims, die die Einwilligungs-App ins Token gelegt hat.
+
+    Sie stehen unter `ext.aiphidias` - Hydra kapselt frei gesetzte Session-Daten
+    dort. Nichts davon ist sicherheitsrelevant: `sub` und `client_id` kommen aus
+    dem Token selbst. Es sind Angaben *über* den Client, die Hydra nicht von
+    sich aus mitschickt, und sie sind so vertrauenswürdig wie die Registrierung,
+    aus der sie stammen - also nur innerhalb desselben Accounts verwendbar.
+
+    Args:
+        claims: Der geprüfte Inhalt des Tokens.
+
+    Returns:
+        Das Zusatz-Objekt, oder ein leeres Mapping.
+    """
+    extra = claims.get("ext")
     aiphidias = extra.get("aiphidias") if isinstance(extra, dict) else None
-    return aiphidias.get("client_name") if isinstance(aiphidias, dict) else None
+    return aiphidias if isinstance(aiphidias, dict) else {}
 
 
 def _escape(text: str) -> str:

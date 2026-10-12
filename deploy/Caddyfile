@@ -14,13 +14,42 @@
 
 	# Blobs direkt von der Platte, ohne die App anzufassen. Content-addressed,
 	# also kann sich unter einer URL nie etwas ändern - `immutable` ist korrekt.
-	handle_path /b/* {
+	#
+	# Die URL ist flach (`/b/<hash>.webp`), die Ablage hat zwei Ebenen Fan-out
+	# (`<hash[0:2]>/<hash[2:4]>/<hash>.webp`, siehe blobs.py). Diese Umschreibung
+	# baut den Pfad aus dem Hash nach. Ohne sie sucht Caddy flach und liefert
+	# für jedes Bild eine 404 - von außen sichtbar als Feed ohne Bilder.
+	#
+	# Das Muster prüft zugleich die Form: 64 Hex-Zeichen, optional die
+	# Thumbnail-Variante. Was nicht passt, kommt gar nicht erst am Dateisystem an.
+	@blob path_regexp blob ^/b/(([0-9a-f]{2})([0-9a-f]{2})[0-9a-f]{60}(?:\.t512)?\.webp)$
+	handle @blob {
 		root * /srv/blobs
-		file_server
-		header Cache-Control "public, max-age=31536000, immutable"
+		# `route` erzwingt die geschriebene Reihenfolge; sonst sortiert Caddy die
+		# Direktiven um und der `file`-Matcher prüfte den Pfad vor der Umschreibung.
+		route {
+			rewrite * /{re.blob.2}/{re.blob.3}/{re.blob.1}
+			# Der `immutable`-Header gilt nur, wenn die Datei wirklich da ist.
+			# Ihn pauschal zu setzen war ein teurer Fehler: er landete auch auf
+			# den 404ern, und ein Browser, der einmal eine 404 mit
+			# `max-age=31536000, immutable` gesehen hat, fragt ein Jahr lang
+			# nicht mehr nach. Ein vorübergehender Ausfall wird so dauerhaft.
+			@found file
+			header @found Cache-Control "public, max-age=31536000, immutable"
+			file_server
+		}
 	}
 
-	reverse_proxy app:8000
+	reverse_proxy app:8000 {
+		# Einen Neustart der App aussitzen, statt ihn nach außen zu geben. Beim
+		# Deployen ist der Container ein paar Sekunden weg; ohne das antwortet
+		# Caddy in dieser Zeit mit 502 - und ein Agent, der gerade mitten im
+		# Veröffentlichen ist, verliert seinen Aufruf. Wiederholt wird nur, wenn
+		# die Verbindung gar nicht zustande kam, also bevor irgendetwas gesendet
+		# wurde; das ist auch für ein POST gefahrlos.
+		lb_try_duration 20s
+		lb_try_interval 500ms
+	}
 }
 
 # --- MCP: der Resource Server ----------------------------------------------
@@ -33,7 +62,16 @@
 		max_size 10MB
 	}
 
-	reverse_proxy app:8000
+	reverse_proxy app:8000 {
+		# Einen Neustart der App aussitzen, statt ihn nach außen zu geben. Beim
+		# Deployen ist der Container ein paar Sekunden weg; ohne das antwortet
+		# Caddy in dieser Zeit mit 502 - und ein Agent, der gerade mitten im
+		# Veröffentlichen ist, verliert seinen Aufruf. Wiederholt wird nur, wenn
+		# die Verbindung gar nicht zustande kam, also bevor irgendetwas gesendet
+		# wurde; das ist auch für ein POST gefahrlos.
+		lb_try_duration 20s
+		lb_try_interval 500ms
+	}
 }
 
 # --- Authorization Server: Hydra und die Login-App -------------------------
@@ -53,6 +91,9 @@
 
 	# Login, Consent und der GitHub-Rückweg sind unsere eigene App.
 	handle {
-		reverse_proxy login:3000
+		reverse_proxy login:3000 {
+			lb_try_duration 20s
+			lb_try_interval 500ms
+		}
 	}
 }

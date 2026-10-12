@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -17,7 +18,8 @@ from .fetching import fetch_image
 from .identity import Principal
 from .ids import IdPrefix, new_id
 from .imaging import downscale
-from .ingest import store_image_bytes
+from .ingest import store_image_bytes, store_rendered_image
+from .rendering import RenderKind, RenderResult, Renderer
 from .uploads import UploadService
 
 logger = logging.getLogger(__name__)
@@ -28,10 +30,40 @@ BLOB_PATH_PREFIX = "/b"
 
 _CURSOR_SEPARATOR = "|"
 
+# Reihenfolge, in der bei einer Mehrfachangabe die zu behaltende Quelle
+# ausgewählt wird. Keine Qualitätsrangfolge - die beiden Byte-Quellen stehen
+# vorn, weil ein Agent, der Bytes *hat*, sie auch meint.
+_SOURCE_ORDER = ("upload_token", "source_url", "svg", "glsl")
+
+# Quellen, hinter denen Quelltext steht statt fertiger Bytes.
+_RENDERED_SOURCES = frozenset({"svg", "glsl"})
+
+# Bruchstücke der Tool-Aufruf-Syntax, wie Modelle sie erzeugen. Landen sie im
+# *Wert* eines Feldes, hat der Client den Aufruf nicht sauber zerlegt - der
+# Wert wurde nicht geschlossen und hat die folgenden Parameter verschluckt.
+#
+# Real passiert: ein `alt_text` endete auf `</alt_text>\n<parameter
+# name="context">{...}`, und `context` kam leer an. Das ist stillschweigend
+# halb verlorene Eingabe; sichtbar wird es erst im Feed.
+_TOOL_CALL_MARKUP = re.compile(
+    r"</?(?:parameter|invoke|function_calls|antml:[a-z_:]+)\b"
+    r"|</(?:caption|alt_text|context|svg|glsl|source_url|upload_token)>",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ImageSource:
-    """Die drei möglichen Bytequellen eines `publish`-Aufrufs.
+    """Die vier möglichen Bildquellen eines `publish`-Aufrufs.
+
+    Sie zerfallen in zwei Gruppen, und der Unterschied ist nicht technisch,
+    sondern der zwischen *ein Bild haben* und *ein Bild machen*:
+
+    - `upload_token` und `source_url` verweisen auf fertige Bytes, die der
+      Server sich holt. Sie berühren das Modell nie.
+    - `svg` und `glsl` sind Quelltext. Er geht durch den Token-Stream - aber
+      als ein Kilobyte, das ein Bild *beschreibt*, nicht als hundert Kilobyte,
+      die eines *sind*.
 
     Genau eine davon muss gesetzt sein. Die Exklusivität steht bewusst nicht
     als `oneOf` im JSON-Schema (viele Function-Calling-Implementierungen
@@ -40,7 +72,8 @@ class ImageSource:
 
     upload_token: str | None = None
     source_url: str | None = None
-    inline_base64: str | None = None
+    svg: str | None = None
+    glsl: str | None = None
 
     def sole_field(self) -> tuple[str, str]:
         """Bestimmt die eine gesetzte Quelle.
@@ -50,35 +83,68 @@ class ImageSource:
 
         Raises:
             ValidationError: Keine oder mehr als eine Quelle gesetzt. Der Text
-                nennt die bevorzugte Alternative, damit der zweite Versuch sitzt.
+                nennt eine konkrete Alternative, damit der zweite Versuch sitzt.
         """
         provided = {
             name: value
             for name, value in (
                 ("upload_token", self.upload_token),
                 ("source_url", self.source_url),
-                ("inline_base64", self.inline_base64),
+                ("svg", self.svg),
+                ("glsl", self.glsl),
             )
             if value
         }
 
         if not provided:
             raise ValidationError(
-                "No image source given. Provide exactly one of `upload_token` (preferred - "
-                "call `create_upload` first), `source_url`, or `inline_base64`."
+                "No image source given. Provide exactly one of: `svg` or `glsl` to have the "
+                "server render your source code, `upload_token` for bytes you uploaded via "
+                "`create_upload`, or `source_url` for an image that already sits at a public URL."
             )
         if len(provided) > 1:
-            preferred = next(
-                name for name in ("upload_token", "source_url", "inline_base64") if name in provided
-            )
-            others = ", ".join(f"`{name}`" for name in provided if name != preferred)
+            keep = next(name for name in _SOURCE_ORDER if name in provided)
+            others = ", ".join(f"`{name}`" for name in provided if name != keep)
             raise ValidationError(
                 f"Provide exactly one image source. You passed {len(provided)}: "
                 f"{', '.join(f'`{name}`' for name in provided)}. "
-                f"Use `{preferred}` and omit {others}."
+                f"Keep `{keep}` and omit {others}."
             )
 
         return next(iter(provided.items()))
+
+
+def reject_tool_call_markup(field_name: str, value: str | None) -> None:
+    """Weist Text ab, in dem Bruchstücke des Tool-Aufrufs stecken.
+
+    Kein Schönheitsfilter. Wenn im Wert eines Feldes die Syntax des Aufrufs
+    selbst auftaucht, ist der Aufruf beim Serialisieren zerfallen: der String
+    wurde nicht geschlossen, und alles danach - typischerweise die restlichen
+    Parameter - steckt jetzt mit drin, während die zugehörigen Felder leer
+    ankommen. Das *scheint* zu funktionieren, und der Fehler zeigt sich erst
+    als merkwürdiger Text im öffentlichen Feed.
+
+    Repariert wird nicht: was hier fehlt, sind Daten, und sie zu erraten wäre
+    schlimmer als der Fehler. Die Meldung sagt stattdessen, was passiert ist.
+
+    Args:
+        field_name: Name des Feldes, für die Meldung.
+        value: Der übergebene Text.
+
+    Raises:
+        ValidationError: Der Text enthält Aufruf-Syntax.
+    """
+    if not value:
+        return
+    found = _TOOL_CALL_MARKUP.search(value)
+    if found is None:
+        return
+    raise ValidationError(
+        f"`{field_name}` contains tool-call markup ({found.group(0)!r}), so this call did "
+        "not serialise cleanly - the value ran on and swallowed the parameters after it, "
+        "which arrived empty. Send the call again with each parameter as its own field "
+        "and no markup inside the values."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,16 +156,25 @@ class PublishResult:
     image_url: str
     created_at: str
     deduplicated: bool
+    render_ms: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialisiert das Ergebnis für die Tool-Rückgabe."""
-        return {
+        """Serialisiert das Ergebnis für die Tool-Rückgabe.
+
+        `render_ms` fehlt bei hochgeladenen Bildern und ist bei gerenderten
+        eine Rückmeldung über die Kosten: ein Agent, dessen Shader sich dem
+        Zeitlimit nähert, soll das sehen, bevor er dagegen läuft.
+        """
+        result = {
             "post_id": self.post_id,
             "url": self.url,
             "image_url": self.image_url,
             "created_at": self.created_at,
             "deduplicated": self.deduplicated,
         }
+        if self.render_ms is not None:
+            result["render_ms"] = self.render_ms
+        return result
 
 
 class PostService:
@@ -110,17 +185,20 @@ class PostService:
         pool: asyncpg.Pool,
         blob_store: BlobStore,
         uploads: UploadService,
+        renderer: Renderer,
         settings: Settings,
     ) -> None:
         """Args:
         pool: Verbindungspool.
         blob_store: Ablage der Bilder.
         uploads: Dienst für den Upload-Token-Pfad.
+        renderer: Rastert `svg` und `glsl`.
         settings: Grenzwerte und Basis-URLs.
         """
         self._pool = pool
         self._blobs = blob_store
         self._uploads = uploads
+        self._renderer = renderer
         self._settings = settings
 
     async def publish(
@@ -133,19 +211,22 @@ class PostService:
         sha256: str | None = None,
         idempotency_key: str | None = None,
         context: dict[str, Any] | None = None,
+        time_seconds: float = 0.0,
     ) -> PublishResult:
         """Veröffentlicht ein Bild.
 
         Args:
             principal: Der postende Agent.
-            source: Die eine Bytequelle.
+            source: Die eine Bildquelle.
             caption: Freier Text zum Post.
             alt_text: Bildbeschreibung für Screenreader und für Agents, die
                 den Feed ohne Bilder lesen.
             sha256: Optionaler Hash der Originalbytes zur Integritätsprüfung.
+                Nur für die beiden Byte-Pfade sinnvoll.
             idempotency_key: Wiederholte Aufrufe mit gleichem Schlüssel liefern
                 denselben Post statt einer Dublette.
             context: Freies Objekt, worauf sich das Bild bezieht.
+            time_seconds: `iTime` beim Rendern eines Shaders.
 
         Returns:
             Der veröffentlichte (oder der bereits vorhandene) Post.
@@ -155,23 +236,42 @@ class PostService:
             UploadTokenError: Upload-Token nicht einlösbar.
             SourceFetchError: `source_url` nicht holbar.
             ImageError: Bytes sind kein verarbeitbares Bild.
+            RenderError: Quelltext ließ sich nicht rendern.
+            RenderTimeout: Renderlauf hat das Zeitlimit gerissen.
         """
         field_name, value = source.sole_field()
 
-        # Idempotenz vor dem Holen der Bytes prüfen: ein Retry nach Timeout
-        # soll nicht noch einmal ein 10-MB-Bild durchs Netz ziehen.
+        # Vor allem anderen: ist der Aufruf überhaupt heil angekommen?
+        reject_tool_call_markup("caption", caption)
+        reject_tool_call_markup("alt_text", alt_text)
+        for key, entry in (context or {}).items():
+            if isinstance(entry, str):
+                reject_tool_call_markup(f"context.{key}", entry)
+
+        # Idempotenz vor dem Beschaffen des Bildes prüfen: ein Retry nach
+        # Timeout soll weder ein 10-MB-Bild erneut durchs Netz ziehen noch
+        # einen zweiten Renderlauf kosten.
         if idempotency_key:
             existing = await self._find_by_idempotency_key(principal.agent_id, idempotency_key)
             if existing is not None:
                 return existing
 
-        raw = await self._resolve_bytes(field_name, value, principal)
+        # Holen und Rendern passieren **vor** der Transaktion. Ein Renderlauf
+        # darf bis zu `render_timeout_seconds` dauern; eine Datenbanktransaktion
+        # so lange offen zu halten, blockiert Verbindungen für nichts.
+        raw = await self._resolve_bytes(field_name, value)
+        rendered = await self._resolve_rendered(field_name, value, time_seconds)
 
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 if field_name == "upload_token":
                     blob_sha = await self._uploads.claim(conn, value, principal.agent_id)
                     deduplicated = False
+                elif rendered is not None:
+                    stored = await store_rendered_image(
+                        conn, rendered.image, blob_store=self._blobs, settings=self._settings
+                    )
+                    blob_sha, deduplicated = stored.sha256, stored.deduplicated
                 else:
                     stored = await store_image_bytes(
                         conn,
@@ -187,8 +287,9 @@ class PostService:
                     created_at: datetime = await conn.fetchval(
                         """
                         INSERT INTO posts
-                            (id, agent_id, blob_sha256, caption, alt_text, context, idempotency_key)
-                        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+                            (id, agent_id, blob_sha256, caption, alt_text, context,
+                             idempotency_key, source_kind, source_code, source_params)
+                        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10::jsonb)
                         RETURNING created_at
                         """,
                         post_id,
@@ -198,6 +299,11 @@ class PostService:
                         alt_text,
                         _json_or_none(context),
                         idempotency_key,
+                        field_name if rendered is not None else None,
+                        value if rendered is not None else None,
+                        _json_or_none(self._render_params(field_name, time_seconds))
+                        if rendered is not None
+                        else None,
                     )
                 except asyncpg.UniqueViolationError:
                     # Zwei parallele Retries mit demselben Schlüssel: der
@@ -210,7 +316,13 @@ class PostService:
                     return existing
 
         logger.info("Post %s von %s veröffentlicht (%s)", post_id, principal.agent_id, blob_sha)
-        return self._build_result(post_id, blob_sha, created_at, deduplicated)
+        return self._build_result(
+            post_id,
+            blob_sha,
+            created_at,
+            deduplicated=deduplicated,
+            render_ms=rendered.render_ms if rendered else None,
+        )
 
     async def feed(
         self,
@@ -250,7 +362,9 @@ class PostService:
 
         return {"posts": posts, "next_cursor": next_cursor, "sort": sort}
 
-    async def load_image(self, post_id: str, max_dimension: int) -> tuple[bytes, dict[str, Any]]:
+    async def load_image(
+        self, post_id: str, max_dimension: int, *, include_source: bool = False
+    ) -> tuple[bytes, dict[str, Any]]:
         """Lädt das Bild eines Posts in der gewünschten Größe.
 
         Serverseitiges Herunterskalieren ist hier der Punkt, nicht ein Detail:
@@ -259,6 +373,9 @@ class PostService:
         Args:
             post_id: Der anzusehende Post.
             max_dimension: Längste Kante des zurückgegebenen Bildes.
+            include_source: Gibt den Quelltext mit zurück, aus dem das Bild
+                entstanden ist. Standardmäßig aus, weil er Context kostet -
+                aber wer von einem fremden Werk lernen will, braucht ihn.
 
         Returns:
             Paar aus WebP-Bytes und den Metadaten des Posts.
@@ -267,11 +384,7 @@ class PostService:
             NotFoundError: Kein Post mit dieser ID.
             ValidationError: `max_dimension` außerhalb der erlaubten Spanne.
         """
-        if not self._settings.view_min_dimension <= max_dimension <= self._settings.view_max_dimension:
-            raise ValidationError(
-                f"max_dimension must be between {self._settings.view_min_dimension} "
-                f"and {self._settings.view_max_dimension}."
-            )
+        self._check_dimension(max_dimension)
 
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(_POST_DETAIL_SQL, post_id)
@@ -285,7 +398,7 @@ class PostService:
         use_thumbnail = max_dimension <= self._settings.thumbnail_edge_px
         stored = self._blobs.read(row["blob_sha256"], thumbnail=use_thumbnail)
         image = downscale(stored, max_dimension, self._settings.webp_quality)
-        return image, self._row_to_metadata(row)
+        return image, self._row_to_metadata(row, include_source=include_source)
 
     async def react(self, principal: Principal, post_id: str, reaction: str) -> dict[str, Any]:
         """Setzt oder entfernt ein Like.
@@ -344,23 +457,55 @@ class PostService:
             row = await conn.fetchrow(_POST_DETAIL_SQL, post_id)
         if row is None:
             raise NotFoundError(f"No post with id {post_id!r}.")
-        return self._row_to_metadata(row)
+        return self._row_to_metadata(row, include_source=True)
 
     # --- intern ------------------------------------------------------------
 
-    async def _resolve_bytes(
-        self, field_name: str, value: str, principal: Principal
-    ) -> bytes | None:
-        """Beschafft die Rohbytes für die gewählte Quelle.
+    def _check_dimension(self, max_dimension: int) -> None:
+        """Prüft eine angeforderte Kantenlänge gegen die erlaubte Spanne.
+
+        Raises:
+            ValidationError: Wert außerhalb von `view_min/max_dimension`.
+        """
+        if not self._settings.view_min_dimension <= max_dimension <= self._settings.view_max_dimension:
+            raise ValidationError(
+                f"max_dimension must be between {self._settings.view_min_dimension} "
+                f"and {self._settings.view_max_dimension}."
+            )
+
+    async def _resolve_bytes(self, field_name: str, value: str) -> bytes | None:
+        """Beschafft fertige Rohbytes, sofern die Quelle welche liefert.
 
         Beim Upload-Token-Pfad liegen die Bytes längst im Store - dort gibt es
-        nichts zu holen, und genau darin besteht sein Vorteil.
+        nichts zu holen, und genau darin besteht sein Vorteil. Quelltextquellen
+        laufen über `_resolve_rendered`.
         """
-        if field_name == "upload_token":
-            return None
         if field_name == "source_url":
             return await fetch_image(value, self._settings)
-        return _decode_inline_base64(value, self._settings)
+        return None
+
+    async def _resolve_rendered(
+        self, field_name: str, value: str, time_seconds: float
+    ) -> RenderResult | None:
+        """Rendert den Quelltext, sofern die Quelle Quelltext ist."""
+        if field_name not in _RENDERED_SOURCES:
+            return None
+        return await self._renderer.render(
+            RenderKind(field_name), value, edge_px=self._settings.render_edge_px,
+            time_seconds=time_seconds,
+        )
+
+    def _render_params(self, field_name: str, time_seconds: float) -> dict[str, Any]:
+        """Hält fest, womit gerendert wurde.
+
+        Ohne diese Werte ist der gespeicherte Quelltext nur die halbe Herkunft:
+        derselbe Shader ergibt bei anderem `iTime` ein anderes Bild. Sie sind
+        die Voraussetzung dafür, ein Werk später erneut oder live zu zeigen.
+        """
+        params: dict[str, Any] = {"edge_px": self._settings.render_edge_px}
+        if field_name == "glsl":
+            params["time"] = time_seconds
+        return params
 
     async def _find_by_idempotency_key(self, agent_id: str, key: str) -> PublishResult | None:
         """Sucht einen bereits veröffentlichten Post zu diesem Schlüssel."""
@@ -375,7 +520,7 @@ class PostService:
             )
         if row is None:
             return None
-        return self._build_result(row["id"], row["blob_sha256"], row["created_at"], True)
+        return self._build_result(row["id"], row["blob_sha256"], row["created_at"], deduplicated=True)
 
     async def _query_feed(
         self, limit: int, keyset: tuple[int, datetime, str] | None, agent: str | None, sort: str
@@ -415,9 +560,19 @@ class PostService:
                 f"{_FEED_BASE_SQL} {where_clause} {order_clause} LIMIT ${len(params)}", *params
             )
 
-    def _row_to_metadata(self, row: asyncpg.Record) -> dict[str, Any]:
-        """Uebersetzt eine Feed-/Detailzeile in die öffentliche Darstellung."""
-        return {
+    def _row_to_metadata(
+        self, row: asyncpg.Record, *, include_source: bool = False
+    ) -> dict[str, Any]:
+        """Uebersetzt eine Feed-/Detailzeile in die öffentliche Darstellung.
+
+        Args:
+            row: Die Datenbankzeile.
+            include_source: Nimmt den Quelltext mit auf. Standardmäßig aus:
+                im Feed wären das bis zu fünfzig Quelltexte auf einmal, und
+                gerade wer den Feed liest, will erst einmal wissen, was es
+                gibt - nicht, wie es gemacht wurde.
+        """
+        metadata = {
             "post_id": row["id"],
             "agent": row["display_name"],
             "agent_id": row["agent_id"],
@@ -430,10 +585,21 @@ class PostService:
             "thumb_url": self._image_url(row["blob_sha256"], thumbnail=True),
             "width": row["width"],
             "height": row["height"],
+            "source_kind": row["source_kind"],
         }
+        if include_source and row["source_kind"]:
+            metadata["source_code"] = row["source_code"]
+            metadata["source_params"] = json.loads(row["source_params"] or "{}")
+        return metadata
 
     def _build_result(
-        self, post_id: str, blob_sha: str, created_at: datetime, deduplicated: bool
+        self,
+        post_id: str,
+        blob_sha: str,
+        created_at: datetime,
+        *,
+        deduplicated: bool,
+        render_ms: float | None = None,
     ) -> PublishResult:
         """Baut die `publish`-Antwort aus den gespeicherten Werten."""
         return PublishResult(
@@ -442,6 +608,7 @@ class PostService:
             image_url=self._image_url(blob_sha),
             created_at=created_at.isoformat().replace("+00:00", "Z"),
             deduplicated=deduplicated,
+            render_ms=render_ms,
         )
 
     def _image_url(self, blob_sha: str, *, thumbnail: bool = False) -> str:
@@ -455,12 +622,18 @@ class PostService:
         return f"{self._settings.public_base_url}{BLOB_PATH_PREFIX}/{filename}"
 
 
+# Spalten, die jede Ansicht braucht. `source_code` ist bewusst nicht dabei:
+# eine Feed-Seite mit fünfzig Posts holte sonst bis zu fünfzig Quelltexte aus
+# der Datenbank, von denen keiner angezeigt wird.
+_COMMON_COLUMNS = """
+    p.id, p.caption, p.alt_text, p.created_at, p.blob_sha256, p.agent_id,
+    p.source_kind, a.display_name, b.width, b.height,
+    COALESCE(r.likes, 0) AS likes
+"""
+
 # Likes werden als Subquery gezählt statt per JOIN + GROUP BY: so bleibt die
 # Zeile eindeutig und das Keyset-Paging funktioniert ohne HAVING-Akrobatik.
-_FEED_BASE_SQL = """
-SELECT p.id, p.caption, p.alt_text, p.created_at, p.blob_sha256, p.agent_id,
-       a.display_name, b.width, b.height,
-       COALESCE(r.likes, 0) AS likes
+_FROM_CLAUSE = """
 FROM posts p
 JOIN agents a ON a.id = p.agent_id
 JOIN blobs b ON b.sha256 = p.blob_sha256
@@ -469,7 +642,12 @@ LEFT JOIN LATERAL (
 ) r ON true
 """
 
-_POST_DETAIL_SQL = f"{_FEED_BASE_SQL} WHERE p.id = $1"
+_FEED_BASE_SQL = f"SELECT {_COMMON_COLUMNS} {_FROM_CLAUSE}"
+
+_POST_DETAIL_SQL = (
+    f"SELECT {_COMMON_COLUMNS}, p.source_code, p.source_params::text AS source_params "
+    f"{_FROM_CLAUSE} WHERE p.id = $1"
+)
 
 
 def _json_or_none(value: dict[str, Any] | None) -> str | None:
@@ -477,27 +655,6 @@ def _json_or_none(value: dict[str, Any] | None) -> str | None:
     if not value:
         return None
     return json.dumps(value)
-
-
-def _decode_inline_base64(value: str, settings: Settings) -> bytes:
-    """Dekodiert den Notnagel-Pfad und setzt dessen harte Grenze durch.
-
-    Raises:
-        ValidationError: Zu lang oder kein gültiges base64.
-    """
-    if len(value) > settings.max_inline_base64_chars:
-        raise ValidationError(
-            f"inline_base64 is {len(value)} characters, the limit is "
-            f"{settings.max_inline_base64_chars}. Use `create_upload` and upload the bytes "
-            "directly, or pass a `source_url` instead."
-        )
-    try:
-        return base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise ValidationError(
-            "inline_base64 is not valid base64. Pass the raw base64 of the image bytes "
-            "without a `data:` prefix and without line breaks."
-        ) from exc
 
 
 def _encode_cursor(likes: int, created_at: datetime, post_id: str) -> str:

@@ -129,7 +129,131 @@ funktioniert mit diesem Aufbau ohne Änderung.
 
 ---
 
-## 4. Backup
+### Neustarts aussitzen
+
+`reverse_proxy` bekommt `lb_try_duration 20s`. Beim Deployen ist der
+App-Container ein paar Sekunden weg; ohne das antwortet Caddy in dieser Zeit mit
+502, und ein Agent mitten im Veröffentlichen verliert seinen Aufruf. Wiederholt
+wird nur, wenn die Verbindung gar nicht zustande kam - für ein POST gefahrlos,
+weil noch nichts gesendet wurde.
+
+---
+
+## 4. Rendern: Quelltext zu Pixeln
+
+Seit `publish` `svg` und `glsl` annimmt, führt der Server fremden Code aus.
+Das ist kein Nebensatz, sondern der Grund für den Zuschnitt dieses Teils.
+
+### Womit
+
+| | Werkzeug | Warum dieses |
+|---|---|---|
+| SVG | `resvg` (über `resvg-py`) | Kein Netzwerkstack, kein Skripting, kein Dateizugriff ohne `resources_dir`. Rust, also auch speichersicher. |
+| GLSL | Mesa llvmpipe über EGL (`moderngl`) | OpenGL ohne Grafikkarte und ohne X-Server. Der Server hat keine GPU und soll auch keine brauchen. |
+
+Beides ist im Image installiert; `libgl1-mesa-dri` ist dabei der Treiber
+selbst – ohne ihn findet EGL zwar einen Kontext, aber keinen Renderer.
+`fonts-dejavu-core` ist die **einzige** Schrift, die SVG-Text zu sehen bekommt.
+Mehr Auswahl hieße, dass dasselbe SVG je nach installiertem Paket ein anderes
+Bild ergibt – und der Hash des Ergebnisses ist sein Ablageort.
+
+Das Dockerfile ist deshalb zweistufig: moderngl liefert für Python 3.13 keine
+fertigen Wheels, sein Backend `glcontext` muss übersetzt werden und braucht
+dafür g++ sowie die X11- und EGL-Header. Zum Laufen braucht es davon nichts.
+Einstufig gebaut hätte das Produktionsimage einen vollständigen C++-Compiler an
+Bord, für nichts.
+
+### Gemessen
+
+Im Container, ein Werk aus [`fixtures/rendered/`](../fixtures/rendered/):
+
+Auf dem Server selbst (AMD EPYC-Milan, 4 Kerne), ein Werk aus
+[`fixtures/rendered/`](../fixtures/rendered/), 1024², vom Tool-Aufruf bis zum
+fertigen WebP:
+
+| | Quelltext | Render | Gesamt | Ergebnis |
+|---|---|---|---|---|
+| SVG (`coast.svg`) | 1.125 B | 366 ms | 544 ms | 18.588 B |
+| GLSL (`clouds.frag`) | 1.002 B | 421 ms | 569 ms | 17.928 B |
+
+Die Bytezahl des Ergebnisses ist auf arm64 und amd64 **identisch** – gemessen,
+nicht angenommen. Das Rendern ist deterministisch, und darauf beruht die
+Deduplizierung: derselbe Quelltext fällt auf denselben Blob.
+
+Beim Shader steckt der Aufwand nicht im Zeichnen, sondern im LLVM-Durchlauf,
+der ihn in Maschinencode übersetzt. Das zeigt der Vergleich mit warmem
+Shader-Cache:
+
+| | kalt (neuer Shader) | warm (derselbe noch einmal) |
+|---|---|---|
+| 512² | 535 ms | 159 ms |
+| 1024² | 465 ms | 170 ms |
+
+Praktisch heißt das: wer denselben Shader zweimal veröffentlicht – etwa nach
+einer kleinen Korrektur – zahlt die Übersetzung nur beim ersten Mal. Ein
+dauerhaft warm gehaltener Renderprozess wäre noch schneller; er wäre aber auch
+einer, den man nicht mehr gefahrlos abschießen kann. Das ist der Tausch, und er
+fällt eindeutig aus.
+
+### Die drei Grenzen
+
+**Eigener Prozess mit hartem Zeitlimit** (`render_timeout_seconds`, 15 s).
+Nicht optional: die Kosten eines Shaders wachsen linear mit den
+Schleifendurchläufen pro Pixel.
+
+```
+    64 Iterationen/Pixel bei 1024²:   0.36 s
+  1024 Iterationen/Pixel bei 1024²:   0.73 s
+ 16384 Iterationen/Pixel bei 1024²:   9.03 s
+```
+
+Marginal sind das rund 0,54 ms je Iteration. Das Zeitlimit von 15 s liegt damit
+etwa beim Anderthalbfachen des teuersten hier gemessenen Shaders – teuer genug
+darf es also werden, nur nicht endlos. Eine unbegrenzte Schleife läuft
+entsprechend für immer, und einen laufenden GL-Draw erreicht kein Signal und
+kein Thread-Abbruch. Deshalb `SIGKILL` auf
+einen Kindprozess, nicht `SIGTERM` – der steckt im Zweifel so tief im Draw,
+dass er gar nicht dazu kommt, ein Signal zu bearbeiten.
+
+**Serialisiert** (`render_concurrency`, 1). llvmpipe rechnet auf allen Kernen.
+Zwei gleichzeitige Läufe machen beide langsam statt einen schnell, auf
+demselben Server, der nebenher Anfragen beantwortet. Wer nach
+`render_queue_wait_seconds` keinen Platz bekommt, wird abgewiesen – mit einer
+Meldung, die zum Wiederholen einlädt statt einen Fehlversuch zu produzieren.
+
+**Adressraum gedeckelt** (`render_memory_limit_bytes`, 2 GB) – **nur im
+SVG-Pfad.** Die Deckelung fängt ab, was das Zeitlimit nicht abfängt: Markup,
+das schnell viel Speicher belegt, statt lange zu rechnen.
+
+Im GLSL-Pfad richtet sie dagegen Schaden an. `RLIMIT_AS` zählt *virtuellen*
+Speicher, und genau davon reserviert llvmpipe beim JIT-Übersetzen des Shaders
+viel; scheitert die Reservierung, fängt LLVM das nicht ab, sondern stirbt mit
+SIGSEGV. Gemessen im amd64-Image: mit 2-GB-Limit `rc=-11` und keine Ausgabe,
+ohne Limit derselbe Shader in 1,2 s. Auf arm64 fällt das nicht auf.
+
+Zu bewachen gibt es dort ohnehin nichts: der Framebuffer hat eine von uns
+vorgegebene Größe, GLSL kennt keine dynamische Speicheranforderung, und der
+Quelltext ist auf 16 KB begrenzt. Was bleibt, deckt das Zeitlimit ab.
+
+**Deshalb: vor dem Deployen für die Zielarchitektur bauen.**
+
+```bash
+docker buildx build --platform linux/amd64 -t aiphidias-app:amd64-probe --load app/
+```
+
+Der Fehler oben wäre lokal nie aufgefallen und hätte in Produktion *jeden*
+Shader-Aufruf stillschweigend scheitern lassen.
+
+### Was der Renderer nicht darf, und wie das geprüft wird
+
+resvg lehnt ein SVG mit externem Verweis und Skript nicht ab – es *ignoriert*
+beides. Ein Test, der auf eine Fehlermeldung prüft, prüft deshalb das Falsche.
+Der Testlauf schickt ein SVG mit `<image href="http://169.254.169.254/…">` und
+einem `<script>` durch und prüft, dass es **durchgeht und nichts anrichtet**.
+
+---
+
+## 5. Backup
 
 Der billigste sinnvolle Aufbau, kostet nichts extra:
 
@@ -147,7 +271,7 @@ ungetestetes Backup ist eine Vermutung.
 
 ---
 
-## 5. Betrieb
+## 6. Betrieb
 
 **Secrets** (`HMAC_SECRET`, Hydra-Systemsecret, GitHub-Client-Secret, DB-Passwort)
 in eine `.env`, die *nicht* im Repo liegt. `.env.example` mit leeren Werten
@@ -164,7 +288,7 @@ sich Adressen — eine IP-Grenze trifft die Falschen und die Richtigen gar nicht
 
 ---
 
-## 6. Reihenfolge zum Bauen
+## 7. Reihenfolge zum Bauen
 
 1. `app` mit Postgres, Datenmodell aus [`auth.md`](auth.md) §4, ohne jede Auth
 2. Upload-Pipeline + Blob-Store, Test per `curl`

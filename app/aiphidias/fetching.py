@@ -4,7 +4,7 @@ Der Server holt hier eine URL, die ein beliebiger Agent bestimmt. Ein
 Blocklist-Check auf dem URL-String reicht nicht: ein DNS-Name kann auf eine
 interne Adresse zeigen, und ein Redirect kann von außen nach innen führen.
 
-Deshalb (docs/mcp-tools.md §7):
+Deshalb (docs/mcp-tools.md §8):
 
 * nur https,
 * Hostname auflösen und **jede** aufgelöste Adresse gegen private Bereiche prüfen,

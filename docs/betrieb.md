@@ -38,14 +38,19 @@ Hydra-Sessions (`HYDRA_SYSTEM_SECRET`) ungültig werden.
 
 | Dienst | Aufgabe | RAM (gemessen) |
 |---|---|---|
-| `caddy` | TLS, Blob-Auslieferung von der Platte | 29 MB |
-| `app` | MCP-Server, Upload, Web-UI | 72 MB |
-| `login` | Hydra-Login/Consent, GitHub-Föderation | 54 MB |
-| `hydra` | Authorization Server | 19 MB |
-| `postgres` | Metadaten + Hydras Schema | 42 MB |
+| `caddy` | TLS, Blob-Auslieferung von der Platte | 17 MB |
+| `app` | MCP-Server, Upload, Rendern, Web-UI | 68 MB |
+| `login` | Hydra-Login/Consent, GitHub-Föderation | 64 MB |
+| `hydra` | Authorization Server | 20 MB |
+| `postgres` | Metadaten + Hydras Schema | 43 MB |
 
-Zusammen **217 MB**. Die Schätzung im Entwurf lag bei „realistisch unter 1 GB" —
-das gilt mit reichlich Luft.
+Zusammen **212 MB** im Ruhezustand. Die Schätzung im Entwurf lag bei
+„realistisch unter 1 GB" — das gilt mit reichlich Luft.
+
+Dazu kommt **während eines Renderlaufs** ein Kindprozess: Mesa und LLVM
+brauchen dort mehrere hundert Megabyte, die mit dem Prozess wieder verschwinden.
+Weil nur einer gleichzeitig läuft (`render_concurrency = 1`), ist das eine
+Spitze und keine Grundlast. Die Maschine hat 3,8 GB.
 
 Hydras Admin-Port (4445) ist **nicht** veröffentlicht. Wer ihn erreicht, kann
 Clients anlegen und Einwilligungen bestätigen; er darf nur aus dem Compose-Netz
@@ -79,12 +84,18 @@ docker compose exec -T postgres psql -U aiphidias -c \
   "DELETE FROM accounts WHERE id LIKE 'ac_test_%'"
 ```
 
-44 Prüfungen, vom 401 bis zum veröffentlichten Bild (der Autorisierungsablauf
+55 Prüfungen, vom 401 bis zum veröffentlichten Bild (der Autorisierungsablauf
 läuft zweimal: einmal mit allen Scopes, einmal nur mit Leserecht). Der
 GitHub-Login ist der einzige Teil, den das Skript nicht geht — er verlangt einen
 Menschen an einem Browser.
 
-Zwei der Prüfungen sichern Fehler ab, die den Connector schon einmal zerlegt
+Der Ablauf läuft **dreimal** durch: einmal mit allen Scopes, einmal als zweite
+Registrierung desselben Programms, einmal nur mit Leserecht. Der zweite
+Durchlauf ist die Prüfung auf stabile Agent-Identität — er bekommt
+nachweislich eine andere `client_id` und muss trotzdem denselben Agent
+ergeben.
+
+Weitere Prüfungen sichern Fehler ab, die den Connector schon einmal zerlegt
 haben und sich von außen nicht ansehen lassen, wenn man nur die eine
 Schreibweise testet:
 

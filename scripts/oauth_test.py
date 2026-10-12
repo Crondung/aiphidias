@@ -76,25 +76,42 @@ def _error_text(result: Any) -> str:
     return " ".join(block.text for block in result.content if block.type == "text")
 
 
-def obtain_token(
-    report: Report, endpoints: "Endpoints", *, scopes: str, account_id: str
-) -> tuple[str, str]:
-    """Durchläuft den Autorisierungsablauf und liefert Token und Client-ID.
+def _discover_quietly(http: httpx.Client, mcp_base: str, resource: str) -> dict[str, Any]:
+    """Findet den Authorization Server, ohne etwas zu prüfen.
+
+    Für jeden Anmeldevorgang nach dem ersten: die Discovery muss laufen, aber
+    ihre Ergebnisse hat `_probe_server` bereits geprüft.
+
+    Args:
+        http: Offener HTTP-Client.
+        mcp_base: Basis-URL des Resource Servers.
+        resource: Die kanonische Resource-URI.
+
+    Returns:
+        Die Metadata des Authorization Servers.
+    """
+    path = up.urlparse(resource).path
+    prm = http.get(f"{mcp_base}/.well-known/oauth-protected-resource{path}").json()
+    issuer = prm["authorization_servers"][0]
+    return http.get(f"{issuer}/.well-known/oauth-authorization-server").json()
+
+
+def _probe_server(
+    report: Report, http: httpx.Client, mcp_base: str, resource: str
+) -> dict[str, Any]:
+    """Prüft die serverseitigen Voraussetzungen des Autorisierungsablaufs.
+
+    Hängt nicht am einzelnen Anmeldevorgang und läuft deshalb nur einmal.
 
     Args:
         report: Sammler für die Prüfergebnisse.
-        endpoints: Die Adressen der beteiligten Dienste.
-        scopes: Die anzufordernden Scopes.
-        account_id: Der Account, als der der Login bestätigt wird.
+        http: Offener HTTP-Client, der Weiterleitungen **nicht** folgt.
+        mcp_base: Basis-URL des Resource Servers.
+        resource: Die kanonische Resource-URI.
 
     Returns:
-        Paar aus Access-Token und `client_id`.
+        Die Metadata des Authorization Servers.
     """
-    mcp_base, admin_base = endpoints.mcp, endpoints.admin
-    resource = f"{mcp_base}/mcp"
-    redirect = "http://localhost:9999/callback"
-    http = httpx.Client(timeout=20, follow_redirects=False)
-
     print("\n1. Ohne Token anklopfen")
     # Beide Schreibweisen prüfen: eine Weiterleitung von `/mcp` auf `/mcp/`
     # hat den Connector einmal zum Absturz gebracht - hinter dem Proxy zeigte
@@ -124,13 +141,52 @@ def obtain_token(
     report.check("Metadata liegt am Ort aus RFC 9728 §3.1",
                  http.get(rfc_path).status_code == 200, rfc_path)
     report.check("Header verweist genau dorthin", metadata_url == rfc_path, metadata_url)
+
     issuer = prm["authorization_servers"][0]
     as_meta = http.get(f"{issuer}/.well-known/oauth-authorization-server").json()
     report.check("Authorization-Server-Metadata gefunden", as_meta.get("issuer") == issuer)
     report.check("registration_endpoint angekündigt (DCR)", "registration_endpoint" in as_meta,
                  as_meta.get("registration_endpoint", "— fehlt"))
+    return as_meta
 
-    print("\n3. Client registriert sich selbst")
+
+def obtain_token(
+    report: Report,
+    endpoints: "Endpoints",
+    *,
+    scopes: str,
+    account_id: str,
+    probe_server: bool = False,
+) -> tuple[str, str]:
+    """Durchläuft den Autorisierungsablauf und liefert Token und Client-ID.
+
+    Args:
+        report: Sammler für die Prüfergebnisse.
+        endpoints: Die Adressen der beteiligten Dienste.
+        scopes: Die anzufordernden Scopes.
+        account_id: Der Account, als der der Login bestätigt wird.
+        probe_server: Prüft zusätzlich die serverseitigen Voraussetzungen -
+            401 auf beiden Schreibweisen, Metadata am Ort aus RFC 9728. Die
+            hängen nicht am einzelnen Anmeldevorgang, deshalb nur beim ersten
+            Durchlauf: dreimal dasselbe zu prüfen macht die Ausgabe unlesbar,
+            ohne mehr abzusichern.
+
+    Returns:
+        Paar aus Access-Token und `client_id`.
+    """
+    mcp_base, admin_base = endpoints.mcp, endpoints.admin
+    resource = f"{mcp_base}/mcp"
+    redirect = "http://localhost:9999/callback"
+    http = httpx.Client(timeout=20, follow_redirects=False)
+
+    as_meta = (
+        _probe_server(report, http, mcp_base, resource)
+        if probe_server
+        else _discover_quietly(http, mcp_base, resource)
+    )
+    issuer = as_meta["issuer"]
+
+    print(f"\n3. Client registriert sich selbst ({scopes})")
     registered = http.post(as_meta["registration_endpoint"], json={
         "client_name": "oauth-test-agent", "redirect_uris": [redirect],
         "grant_types": ["authorization_code", "refresh_token"], "response_types": ["code"],
@@ -182,45 +238,159 @@ def obtain_token(
     report.check("Token trägt die richtige Audience", claims.get("aud") == [resource],
                  str(claims.get("aud")))
     report.check("Token trägt den Account als sub", claims.get("sub") == account_id)
-    report.check("Token trägt die client_id (= Agent-Identität)", claims.get("client_id") == client_id)
+    report.check("Token trägt die client_id dieser Registrierung",
+                 claims.get("client_id") == client_id)
+    # Der Anteil, der die Agent-Identität trägt: `client_id` wechselt bei jeder
+    # Registrierung, `app_key` nicht (siehe `check_stable_identity`).
+    report.check("Token trägt einen stabilen app_key",
+                 bool(claims.get("ext", {}).get("aiphidias", {}).get("app_key")),
+                 claims.get("ext", {}).get("aiphidias", {}).get("app_key", "— fehlt"))
     return access_token, client_id
 
 
-async def use_tools(report: Report, mcp_base: str, token: str) -> None:
-    """Benutzt die MCP-Tools mit einem echten Token."""
+async def use_tools(report: Report, mcp_base: str, token: str) -> dict[str, Any]:
+    """Benutzt die MCP-Tools mit einem echten Token.
+
+    Returns:
+        Den ersten Feed-Eintrag - der Aufrufer vergleicht daran die
+        Agent-Identität eines zweiten Anmeldevorgangs.
+    """
     print("\n6. Tools mit gültigem Token")
     async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=30) as hc:
         async with Client(streamable_http_client(f"{mcp_base}/mcp/", http_client=hc)) as session:
             tools = await session.list_tools()
             report.check("Tools sichtbar", len(tools.tools) == 5)
-            tile = _tile()
+
+            # Der Renderer ist im Produktionsimage etwas anderes als lokal:
+            # Mesa, EGL und die Schriften müssen dort tatsächlich installiert
+            # sein. Fehlt eines davon, meldet der Kindprozess nichts, was von
+            # den Tools aus zu sehen wäre - deshalb werden beide Wege benutzt.
+            shader = await session.call_tool("publish", {
+                "glsl": _PROBE_GLSL,
+                "caption": "A soft amber falloff, straight from a shader.",
+                "alt_text": "Warm amber centre fading to near-black at the corners.",
+            })
+            report.check(
+                "Shader wird auf dem Server gerendert",
+                not shader.is_error,
+                _error_text(shader)[:150] if shader.is_error else
+                f"{_payload(shader).get('render_ms')} ms",
+            )
+
             published = _payload(await session.call_tool("publish", {
-                "inline_base64": tile,
+                "svg": _PROBE_SVG,
                 "caption": "Erster Post mit echtem OAuth-Token.",
-                "alt_text": "Einfarbige Fläche in warmem Gelb.",
+                "alt_text": "Dark disc on a warm amber radial gradient.",
             }))
             report.check("publish funktioniert", "post_id" in published, published.get("url", ""))
+            report.check(
+                "SVG wurde serverseitig gerendert",
+                published.get("render_ms", 0) > 0, f"{published.get('render_ms')} ms",
+            )
             feed = _payload(await session.call_tool("feed", {"limit": 5}))
             report.check("feed funktioniert", len(feed.get("posts", [])) >= 1)
-            report.check("Urheber ist der registrierte Client",
-                         feed["posts"][0]["agent"].startswith("Agent "), feed["posts"][0]["agent"])
+            report.check("Urheber ist der Name aus der Registrierung",
+                         feed["posts"][0]["agent"] == "oauth-test-agent",
+                         feed["posts"][0]["agent"])
+            _check_image_delivery(report, published)
+            return feed["posts"][0]
+
+
+def _check_image_delivery(report: Report, published: dict[str, Any]) -> None:
+    """Prüft, dass das veröffentlichte Bild auch wirklich ausgeliefert wird.
+
+    Das ist keine Formalie. In Produktion liefert Caddy die Blobs direkt von der
+    Platte aus, lokal die App - zwei verschiedene Wege für dieselbe URL. Ein
+    Fehler im Produktionsweg (etwa eine Ablagestruktur, die der Reverse Proxy
+    nicht nachbaut) ist von den Tools aus unsichtbar: `publish` meldet Erfolg,
+    der Feed liefert die URL, und trotzdem sieht niemand ein Bild.
+
+    Args:
+        report: Sammler für die Prüfergebnisse.
+        published: Die Antwort von `publish` mit `image_url`.
+    """
+    for label, url in (("Vollbild", published["image_url"]),
+                       ("Thumbnail", published["image_url"].replace(".webp", ".t512.webp"))):
+        response = httpx.get(url, timeout=30, follow_redirects=True)
+        report.check(
+            f"{label} wird ausgeliefert",
+            response.status_code == 200
+            and response.headers.get("content-type") == "image/webp"
+            and len(response.content) > 0,
+            f"HTTP {response.status_code}, {len(response.content)} Bytes",
+        )
+
+    # Ein `immutable`-Header auf einer 404 macht einen vorübergehenden Ausfall
+    # dauerhaft: der Browser fragt ein Jahr lang nicht mehr nach. Genau das ist
+    # einmal passiert und war von außen nur daran zu merken, dass ein Bild bei
+    # einem Besucher fehlte, das per curl längst wieder da war.
+    missing = httpx.get(
+        published["image_url"].rsplit("/", 1)[0] + "/" + "ab" * 32 + ".webp",
+        timeout=30, follow_redirects=True,
+    )
+    report.check(
+        "Fehlendes Bild wird nicht dauerhaft gecacht",
+        missing.status_code == 404 and "immutable" not in missing.headers.get("cache-control", ""),
+        f"HTTP {missing.status_code}, Cache-Control: {missing.headers.get('cache-control', '—')}",
+    )
 
 
 async def check_scope_enforcement(report: Report, mcp_base: str, token: str) -> None:
     """Prüft, dass ein Token ohne Schreibrecht auch nicht schreiben darf."""
-    print("\n7. Token nur mit Leserecht")
+    print("\n8. Token nur mit Leserecht")
     async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=30) as hc:
         async with Client(streamable_http_client(f"{mcp_base}/mcp/", http_client=hc)) as session:
             feed = await session.call_tool("feed", {"limit": 1})
             report.check("feed erlaubt", not feed.is_error)
-            denied = await session.call_tool("publish", {"inline_base64": _tile()})
+            denied = await session.call_tool("publish", {"svg": _PROBE_SVG})
             report.check("publish abgewiesen", denied.is_error and "posts:write" in _error_text(denied),
                          _error_text(denied)[:100])
 
 
+async def check_stable_identity(
+    report: Report, mcp_base: str, token: str, first_post: dict[str, Any]
+) -> None:
+    """Prüft, dass eine **zweite** Registrierung derselbe Agent bleibt.
+
+    Das ist die Regression zu dem Fehler, der die Sache aufgeworfen hat: bei
+    Dynamic Client Registration bekommt jede Anmeldung eine neue `client_id`.
+    Solange die als Agent-Identität diente, entstand bei jeder Anmeldung ein
+    neuer Agent - ein Mensch, ein Programm, und trotzdem im Feed jedes Mal ein
+    anderer Urheber.
+
+    Der Aufrufer hat für dieses Token einen eigenen DCR-Durchlauf gemacht, die
+    `client_id` ist also nachweislich eine andere.
+
+    Args:
+        report: Sammler für die Prüfergebnisse.
+        mcp_base: Basis-URL des Resource Servers.
+        token: Token aus einer zweiten, frischen Registrierung.
+        first_post: Der Feed-Eintrag aus dem ersten Durchlauf.
+    """
+    print("\n7. Zweite Anmeldung, gleicher Agent")
+    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}, timeout=30) as hc:
+        async with Client(streamable_http_client(f"{mcp_base}/mcp/", http_client=hc)) as session:
+            second = _payload(await session.call_tool("publish", {
+                "svg": _PROBE_SVG, "caption": "Zweite Anmeldung, derselbe Agent.",
+            }))
+            feed = _payload(await session.call_tool("feed", {"limit": 5}))
+
+    entry = next((p for p in feed["posts"] if p["post_id"] == second["post_id"]), {})
+    report.check(
+        "neue Registrierung erbt die bestehende Agent-Identität",
+        entry.get("agent_id") == first_post.get("agent_id"),
+        f"{entry.get('agent_id')} vs. {first_post.get('agent_id')}",
+    )
+    report.check(
+        "und damit auch denselben Anzeigenamen",
+        entry.get("agent") == first_post.get("agent"),
+        f"{entry.get('agent')!r} vs. {first_post.get('agent')!r}",
+    )
+
+
 def check_foreign_token(report: Report, endpoints: "Endpoints", account_id: str) -> None:
     """Prüft, dass ein Token für eine andere Resource abgewiesen wird."""
-    print("\n8. Token für einen anderen Dienst")
+    print("\n9. Token für einen anderen Dienst")
     resource = "https://woanders.example.com/mcp"
     redirect = "http://localhost:9999/callback"
     http = httpx.Client(timeout=20, follow_redirects=False)
@@ -256,15 +426,24 @@ def check_foreign_token(report: Report, endpoints: "Endpoints", account_id: str)
         report.check("Fehler ist invalid_target", "invalid_target" in final, up.unquote(final)[:120])
 
 
-def _tile() -> str:
-    """Erzeugt ein kleines Testbild als base64."""
-    import io
+# Ein Testbild als Quelltext statt als Bytes. Klein, aber nicht trivial: mit
+# Verlauf und Transparenz, damit der Renderer auch wirklich etwas zu tun hat.
+_PROBE_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">'
+    '<defs><radialGradient id="g"><stop offset="0%" stop-color="#f0b429"/>'
+    '<stop offset="100%" stop-color="#7a3b12"/></radialGradient></defs>'
+    '<rect width="200" height="200" fill="url(#g)"/>'
+    '<circle cx="100" cy="100" r="52" fill="#0d1017" opacity="0.75"/></svg>'
+)
 
-    from PIL import Image
-
-    buffer = io.BytesIO()
-    Image.new("RGB", (200, 200), "#f0b429").save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
+_PROBE_GLSL = (
+    "void mainImage(out vec4 fragColor, in vec2 fragCoord) {\n"
+    "    vec2 uv = fragCoord / iResolution.xy;\n"
+    "    float r = length(uv - 0.5);\n"
+    "    vec3 col = mix(vec3(0.94, 0.71, 0.16), vec3(0.05, 0.06, 0.09), smoothstep(0.1, 0.5, r));\n"
+    "    fragColor = vec4(col, 1.0);\n"
+    "}\n"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,9 +505,21 @@ def main() -> int:
     account_id = arguments.account_id or prepare_account()
     print(f"Testaccount: {account_id}")
 
-    token, _ = obtain_token(report, endpoints,
-                            scopes="posts:read posts:write reactions:write", account_id=account_id)
-    asyncio.run(use_tools(report, endpoints.mcp, token))
+    token, first_client_id = obtain_token(
+        report, endpoints, scopes="posts:read posts:write reactions:write",
+        account_id=account_id, probe_server=True,
+    )
+    first_post = asyncio.run(use_tools(report, endpoints.mcp, token))
+
+    # Ein zweiter vollständiger Durchlauf: neue Registrierung, neue client_id,
+    # derselbe Mensch und dasselbe Programm.
+    again, second_client_id = obtain_token(
+        report, endpoints, scopes="posts:read posts:write reactions:write", account_id=account_id
+    )
+    report.check("zweite Registrierung hat eine andere client_id",
+                 first_client_id != second_client_id,
+                 f"{first_client_id[:8]} vs. {second_client_id[:8]}")
+    asyncio.run(check_stable_identity(report, endpoints.mcp, again, first_post))
 
     read_only, _ = obtain_token(report, endpoints, scopes="posts:read", account_id=account_id)
     asyncio.run(check_scope_enforcement(report, endpoints.mcp, read_only))

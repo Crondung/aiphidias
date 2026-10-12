@@ -120,6 +120,34 @@ def encode_for_storage(data: bytes, settings: Settings) -> EncodedImage:
         Image.MAX_IMAGE_PIXELS = previous_limit
 
 
+def encode_raster(pixels: bytes, width: int, height: int, quality: int) -> EncodedImage:
+    """Verpackt fertig gerasterte RGB-Bytes als WebP.
+
+    Der Gegenstück-Eingang zu `encode_for_storage`, für Bilder, die der Server
+    selbst erzeugt hat (siehe `rendering/`). Was dort fehlt, fehlt mit Absicht:
+    keine Magic-Byte-Prüfung, weil kein fremdes Format im Spiel ist, und kein
+    Bomb-Schutz, weil die Pixelzahl vorher feststand.
+
+    Args:
+        pixels: Genau `width * height * 3` Bytes in RGB-Reihenfolge.
+        width: Breite in Pixeln.
+        height: Höhe in Pixeln.
+        quality: WebP-Qualität 1-100.
+
+    Returns:
+        Das encodierte Bild, bereit für die Ablage.
+
+    Raises:
+        ImageError: Die Bytemenge passt nicht zu den angegebenen Maßen.
+    """
+    expected = width * height * 3
+    if len(pixels) != expected:
+        raise ImageError(
+            f"Renderer returned {len(pixels)} bytes, expected {expected} for {width}x{height}."
+        )
+    return _to_webp(Image.frombytes("RGB", (width, height), pixels), quality)
+
+
 def downscale(data: bytes, max_dimension: int, quality: int) -> bytes:
     """Verkleinert ein gespeichertes Bild für die Rückgabe an einen Agent.
 

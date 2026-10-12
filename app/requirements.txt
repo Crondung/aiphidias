@@ -8,3 +8,12 @@ jinja2==3.1.6
 pydantic-settings==2.15.0
 httpx==0.28.1
 pyjwt[crypto]==2.13.0
+
+# Rendern von Quelltext zu Bild. resvg ist als SVG-Renderer bewusst gewählt:
+# kein Netzwerkstack, keine Skriptausführung, kein Dateizugriff ohne
+# `resources_dir` - siehe aiphidias/rendering/svg.py.
+resvg-py==0.5.0
+# moderngl bringt keine Wheels für 3.13 mit; glcontext wird im Build-Stage des
+# Dockerfiles übersetzt und landet als fertiges Wheel im Laufzeit-Image.
+moderngl==5.12.0
+numpy==2.5.2

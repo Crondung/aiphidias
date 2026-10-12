@@ -8,7 +8,6 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Well-known-Präfix nach RFC 9728.
@@ -60,8 +59,6 @@ class Settings(BaseSettings):
 
     # --- Upload und Bildverarbeitung --------------------------------------
     max_upload_bytes: int = 10 * 1024 * 1024
-    # Harte Grenze für den Notnagel-Pfad, gemessen in base64-Zeichen.
-    max_inline_base64_chars: int = 128 * 1024
     upload_token_ttl_seconds: int = 300
 
     # Längste Kante nach dem Re-Encoding; alles darüber wird herunterskaliert.
@@ -70,6 +67,38 @@ class Settings(BaseSettings):
     webp_quality: int = 82
     # Schutz vor Decompression-Bombs: Pixelzahl, ab der Pillow abbricht.
     max_image_pixels: int = 50_000_000
+
+    # --- Rendering (SVG und GLSL) -----------------------------------------
+    # Kantenlänge des veröffentlichten Bildes. Bewusst unter `max_image_edge_px`:
+    # die Renderkosten wachsen quadratisch mit der Kante, und bei llvmpipe ist
+    # das CPU-Zeit auf demselben Server, der nebenher Anfragen beantwortet.
+    render_edge_px: int = 1024
+    # Quelltextgrenzen. Großzügig gegenüber dem, was ein Werk tatsächlich
+    # braucht (gemessen: ~1 KB für ein vollständiges Motiv), und trotzdem ein
+    # Bruchteil dessen, was base64 für dasselbe Bild gekostet hat.
+    max_svg_source_chars: int = 64 * 1024
+    max_glsl_source_chars: int = 16 * 1024
+    # Nach dieser Zeit wird der Renderprozess hart abgeschossen. Ohne dieses
+    # Limit hängt eine unbegrenzte Schleife im Shader den Server auf; ein
+    # laufender GL-Draw lässt sich innerhalb des Prozesses nicht abbrechen.
+    # 15 s ist rund das Anderthalbfache des teuersten gemessenen Shaders
+    # (16.384 Iterationen je Pixel bei 1024²: 9,0 s) - teuer darf es werden,
+    # endlos nicht.
+    render_timeout_seconds: float = 15.0
+    # Gleichzeitige Renderläufe. Eins ist Absicht: llvmpipe rechnet auf allen
+    # Kernen, zwei parallele Läufe machen beide langsam statt einen schnell.
+    render_concurrency: int = 1
+    # So lange darf ein Aufruf auf einen freien Renderplatz warten, bevor er
+    # mit einer verständlichen Meldung abgewiesen wird.
+    render_queue_wait_seconds: float = 20.0
+    # Schriften für SVG-Text. Explizit statt Systemsuche, damit dasselbe SVG
+    # überall dasselbe Bild ergibt - der Hash ist der Ablageort.
+    render_font_dir: Path = Path("/usr/share/fonts/truetype/dejavu")
+    # Adressraum des Renderprozesses - **nur im SVG-Pfad**. Fängt ab, was das
+    # Zeitlimit nicht abfängt: Markup, das schnell viel Speicher belegt statt
+    # lange zu rechnen. Auf den Shader angewandt bringt dieselbe Deckelung
+    # llvmpipe zum Absturz, siehe rendering/worker.py. `0` schaltet sie ab.
+    render_memory_limit_bytes: int = 2 * 1024 * 1024 * 1024
 
     # --- Fetch von source_url ---------------------------------------------
     source_fetch_timeout_seconds: float = 10.0
@@ -112,11 +141,6 @@ class Settings(BaseSettings):
         mit der Hälfte der Clients nicht.
         """
         return f"{self.mcp_base_url}{WELL_KNOWN_PROTECTED_RESOURCE}{self.resource_path}"
-
-    @property
-    def max_inline_image_bytes(self) -> int:
-        """Rohbytes, die durch `max_inline_base64_chars` gerade noch passen."""
-        return self.max_inline_base64_chars * 3 // 4
 
 
 @lru_cache(maxsize=1)

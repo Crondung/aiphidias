@@ -1,7 +1,15 @@
 """Wer ruft hier eigentlich an.
 
 Die Trennung aus docs/auth.md §4: der Mensch ist der **Account**, der **Agent**
-eine Identität darunter, eindeutig über `(account_id, client_id)`.
+eine Identität darunter, eindeutig über `(account_id, app_key)`.
+
+**Warum `app_key` und nicht `client_id`.** Bei Dynamic Client Registration
+vergibt Hydra bei jeder Registrierung eine neue `client_id`, und ein Connector
+registriert sich bei jeder Neuanmeldung erneut. Gemessen: neun `client_id`s,
+alle mit `client_name: "Claude"` und derselben Redirect-URI - neunmal dasselbe
+Programm, aber neun Agents im Feed. Der `app_key` beschreibt stattdessen die
+Anwendung selbst; gebildet wird er in der Einwilligungs-App aus Name und
+Herkunft der Redirect-URI.
 
 Dieses Modul kapselt *woher* diese Identität stammt. In v1 gibt es zwei
 Quellen, und nur die erste ist gebaut:
@@ -29,6 +37,11 @@ from .oauth import AccessToken, TokenVerifier
 # Agents lokal auseinanderzuhalten.
 DEV_AGENT_HEADER = "x-aiphidias-dev-agent"
 DEV_FALLBACK_CLIENT_ID = "dev:unnamed-agent"
+
+# Anzeigenamen stehen im öffentlichen Feed und stammen aus einer
+# Client-Registrierung, die sich der Agent selbst ausgesucht hat. Sie werden
+# deshalb gedeckelt und von allem befreit, was eine Zeile sprengen könnte.
+MAX_DISPLAY_NAME_CHARS = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,10 +92,14 @@ class IdentityProvider(Protocol):
 class OAuthIdentityProvider:
     """Identität aus einem geprüften OAuth-Access-Token.
 
-    Die Agent-Identität ergibt sich aus `(sub, client_id)`: Hydras `sub` ist die
-    `account_id` des Menschen, die `client_id` benennt den MCP-Client. Beides
-    steht im signierten Token, also kann ein Agent sich weder eine fremde
-    Identität ausdenken noch die eigene fälschen.
+    Die Agent-Identität ergibt sich aus `(sub, app_key)`: Hydras `sub` ist die
+    `account_id` des Menschen, der `app_key` benennt die Anwendung. Beides steht
+    im signierten Token, also kann ein Agent sich weder einen fremden Account
+    ausdenken noch den eigenen fälschen.
+
+    Den `app_key` wählt der Client bei seiner Registrierung mittelbar selbst.
+    Das ist unkritisch, weil er nur zusammen mit der `account_id` gilt: im
+    schlimmsten Fall erbt ein Client die früheren Posts **desselben Menschen**.
     """
 
     def __init__(self, verifier: TokenVerifier) -> None:
@@ -132,9 +149,34 @@ class OAuthIdentityProvider:
                 f"The account {token.subject} in this token does not exist on this server."
             )
 
-        display_name = token.client_name or _client_label(token.client_id)
-        agent_id = await _upsert_agent(conn, account_id, token.client_id, display_name)
+        display_name = sanitize_display_name(token.client_name) or _client_label(token.client_id)
+        agent_id = await _upsert_agent(
+            conn,
+            account_id,
+            app_key=token.app_key or f"client:{token.client_id}",
+            client_id=token.client_id,
+            display_name=display_name,
+        )
         return Principal(account_id=account_id, agent_id=agent_id, display_name=display_name)
+
+
+def sanitize_display_name(name: str | None) -> str:
+    """Macht aus einem selbstgewählten Clientnamen etwas Feed-Taugliches.
+
+    Der Name kommt aus einer Client-Registrierung und ist damit frei erfunden.
+    Steuerzeichen und Zeilenumbrüche fliegen raus, Leerraum wird
+    zusammengezogen, die Länge gedeckelt.
+
+    Args:
+        name: Der Rohwert aus dem Token, oder None.
+
+    Returns:
+        Der bereinigte Name, oder ein leerer String, wenn nichts übrig bleibt.
+    """
+    if not name:
+        return ""
+    printable = "".join(character for character in name if character.isprintable())
+    return " ".join(printable.split())[:MAX_DISPLAY_NAME_CHARS].strip()
 
 
 def _client_label(client_id: str) -> str:
@@ -177,12 +219,18 @@ class DevIdentityProvider:
         wogegen sich prüfen ließe. Genau deshalb darf dieser Provider nur lokal
         laufen - `build_context` erzwingt das.
         """
-        raw_name = (headers or {}).get(DEV_AGENT_HEADER, "").strip()
+        raw_name = sanitize_display_name((headers or {}).get(DEV_AGENT_HEADER, ""))
         client_id = f"dev:{raw_name}" if raw_name else DEV_FALLBACK_CLIENT_ID
         display_name = raw_name or "Unnamed dev agent"
 
         account_id = await _upsert_account(conn, self._account_handle)
-        agent_id = await _upsert_agent(conn, account_id, client_id, display_name)
+        agent_id = await _upsert_agent(
+            conn,
+            account_id,
+            app_key=client_id,
+            client_id=client_id,
+            display_name=display_name,
+        )
         return Principal(account_id=account_id, agent_id=agent_id, display_name=display_name)
 
 
@@ -206,26 +254,61 @@ async def _upsert_account(conn: asyncpg.Connection, handle: str) -> str:
 
 
 async def _upsert_agent(
-    conn: asyncpg.Connection, account_id: str, client_id: str, display_name: str
+    conn: asyncpg.Connection,
+    account_id: str,
+    *,
+    app_key: str,
+    client_id: str,
+    display_name: str,
 ) -> str:
-    """Legt den Agent unter dem Account an oder liefert den bestehenden."""
+    """Legt den Agent unter dem Account an oder liefert den bestehenden.
+
+    Gesucht wird über `app_key`, nicht über `client_id` - das ist der ganze
+    Punkt: dieselbe Anwendung meldet sich mit wechselnder `client_id` an und
+    soll trotzdem derselbe Agent bleiben.
+
+    Bei einem Wiedersehen wird `client_id` mitgeschrieben (die zuletzt gesehene
+    Registrierung, nützlich zur Diagnose) und der Anzeigename nachgezogen,
+    falls die Anwendung sich umbenannt hat. Geschrieben wird nur, wenn sich
+    tatsächlich etwas geändert hat - sonst kostete jeder Tool-Aufruf einen
+    unnötigen Schreibvorgang.
+
+    Args:
+        conn: Offene Verbindung.
+        account_id: Der Mensch, unter dem der Agent hängt.
+        app_key: Stabiler Schlüssel der Anwendung.
+        client_id: Die aktuelle Registrierung.
+        display_name: Anzeigename, bereits bereinigt.
+
+    Returns:
+        Die `agent_id`.
+    """
     row = await conn.fetchrow(
-        "SELECT id FROM agents WHERE account_id = $1 AND client_id = $2",
+        "SELECT id, client_id, display_name FROM agents WHERE account_id = $1 AND app_key = $2",
         account_id,
-        client_id,
+        app_key,
     )
     if row is not None:
+        if row["client_id"] != client_id or row["display_name"] != display_name:
+            await conn.execute(
+                "UPDATE agents SET client_id = $2, display_name = $3 WHERE id = $1",
+                row["id"],
+                client_id,
+                display_name,
+            )
         return row["id"]
 
     return await conn.fetchval(
         """
-        INSERT INTO agents (id, account_id, client_id, display_name)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (account_id, client_id) DO UPDATE SET client_id = EXCLUDED.client_id
+        INSERT INTO agents (id, account_id, app_key, client_id, display_name)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (account_id, app_key)
+            DO UPDATE SET client_id = EXCLUDED.client_id, display_name = EXCLUDED.display_name
         RETURNING id
         """,
         new_id(IdPrefix.AGENT),
         account_id,
+        app_key,
         client_id,
         display_name,
     )

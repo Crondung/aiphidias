@@ -25,6 +25,8 @@ from mcp.client.streamable_http import streamable_http_client
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_IMAGE = REPO_ROOT / "fixtures" / "first-post" / "image.png"
 FIXTURE_PAYLOAD = REPO_ROOT / "fixtures" / "first-post" / "publish.json"
+FIXTURE_SVG = REPO_ROOT / "fixtures" / "rendered" / "coast.svg"
+FIXTURE_GLSL = REPO_ROOT / "fixtures" / "rendered" / "clouds.frag"
 
 AGENT_HEADER = "X-Aiphidias-Dev-Agent"
 AGENT_NAME = "smoke-test"
@@ -105,13 +107,26 @@ async def run(base_url: str) -> int:
                 "create_upload", "publish", "feed", "view_post", "react"
             }, ", ".join(sorted(names)))
             publish_tool = next(t for t in tools.tools if t.name == "publish")
+            # Umbrüche normalisieren: die Description ist auf Zeilenlänge
+            # umbrochen, und ein Satz kann über zwei Zeilen gehen. Auf die
+            # rohe Fassung zu prüfen macht den Test an der Formatierung
+            # zerbrechlich, ohne dass er dadurch mehr prüft.
+            description = " ".join(publish_tool.description.split())
             report.check(
-                "publish-Description nennt die Rangfolge der Bytequellen",
-                "Use the FIRST one your" in publish_tool.description,
+                "publish-Description trennt Machen und Haben",
+                "MAKING the image or already HAVE it" in description,
+            )
+            report.check(
+                "publish-Description verbietet Rückschlüsse auf den Menschen",
+                "never do is identify the human" in description,
             )
             report.check(
                 "publish-Schema enthält kein oneOf/anyOf auf oberster Ebene",
                 "oneOf" not in publish_tool.input_schema,
+            )
+            report.check(
+                "publish bietet base64 nicht mehr an",
+                "inline_base64" not in json.dumps(publish_tool.input_schema),
             )
 
             print("\n2. Bevorzugter Weg: create_upload → HTTP-POST → publish")
@@ -148,22 +163,60 @@ async def run(base_url: str) -> int:
                 repeated.get("post_id") == published.get("post_id"),
             )
 
-            print("\n4. Notnagel-Pfad: inline_base64")
-            small = _shrink_to_inline_limit(image_bytes)
-            inline = _payload(await session.call_tool("publish", {
-                "inline_base64": base64.b64encode(small).decode(),
-                "caption": "Kleines Bild über den Notnagel-Pfad.",
-                "alt_text": "Verkleinerte Fassung des Fixture-Bildes.",
+            print("\n4. Quelltext rendern und veröffentlichen")
+            svg_source = FIXTURE_SVG.read_text()
+            glsl_source = FIXTURE_GLSL.read_text()
+
+            shader_post = _payload(await session.call_tool("publish", {
+                "glsl": glsl_source, "time": 8.0,
+                "caption": "Warm light through cloud, six octaves of value noise.",
+                "alt_text": "Cream-coloured cloud forms lit from within, over slate blue.",
             }))
-            report.check("inline_base64 veröffentlicht", "post_id" in inline)
+            report.check("Shader veröffentlicht", "post_id" in shader_post,
+                         f"{shader_post.get('render_ms')} ms")
+
+            svg_post = _payload(await session.call_tool("publish", {
+                "svg": svg_source,
+                "caption": "A coastline at dusk, in paths and gradients.",
+                "alt_text": "Sun low over a dark sea, headlands on both sides.",
+            }))
+            report.check("SVG veröffentlicht", "post_id" in svg_post,
+                         f"{svg_post.get('render_ms')} ms")
+
+            # Rendern ist deterministisch - derselbe Quelltext muss auf denselben
+            # Blob fallen. Ginge das schief, wüchse der Store mit jedem Repost.
+            svg_again = _payload(await session.call_tool("publish", {
+                "svg": svg_source, "caption": "Derselbe Quelltext, zweiter Post.",
+            }))
+            report.check(
+                "gleicher Quelltext ergibt denselben Blob",
+                svg_again.get("image_url") == svg_post.get("image_url"),
+            )
+
+            # Ein SVG behält seine Proportion. Würde die Kantenlänge als feste
+            # Größe durchgereicht, käme jedes Werk quadratisch gequetscht heraus
+            # - und zwar ohne Fehlermeldung.
+            wide_post = _payload(await session.call_tool("publish", {
+                "svg": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 100">'
+                       '<rect width="300" height="100" fill="#0d1017"/></svg>',
+                "caption": "Ein breites Format.",
+            }))
+            wide_view = _payload(await session.call_tool("view_post", {
+                "post_id": wide_post["post_id"], "max_dimension": 512,
+            }))
+            report.check(
+                "SVG behält seine Proportion",
+                (wide_view.get("width"), wide_view.get("height")) == (1024, 342),
+                f"{wide_view.get('width')}x{wide_view.get('height')}",
+            )
 
             print("\n5. Fehlermeldungen, die einen zweiten Versuch leiten")
             both = await session.call_tool("publish", {
-                "source_url": "https://example.com/x.png", "inline_base64": "AAAA",
+                "source_url": "https://example.com/x.png", "svg": "<svg/>",
             })
             report.check(
-                "zwei Quellen → Meldung nennt die zu bevorzugende",
-                both.is_error and "Use `source_url`" in _error_text(both),
+                "zwei Quellen → Meldung nennt die zu behaltende",
+                both.is_error and "Keep `source_url`" in _error_text(both),
                 _error_text(both)[:150],
             )
 
@@ -176,12 +229,52 @@ async def run(base_url: str) -> int:
                 _error_text(ssrf)[:120],
             )
 
-            not_an_image = await session.call_tool("publish", {
-                "inline_base64": base64.b64encode(b"definitiv kein Bild").decode(),
+            broken_shader = await session.call_tool("publish", {
+                "glsl": "void mainImage(out vec4 c, in vec2 p){ c = vec4(nope, 1.0); }",
             })
             report.check(
-                "Nicht-Bild abgewiesen",
-                not_an_image.is_error and "not a supported image" in _error_text(not_an_image),
+                "Shader-Compilerfehler nennt die Zeile im eigenen Quelltext",
+                broken_shader.is_error and "line 1, column" in _error_text(broken_shader),
+                _error_text(broken_shader)[:150],
+            )
+
+            wrong_entry = await session.call_tool("publish", {"glsl": "void main(){}"})
+            report.check(
+                "falscher Einstiegspunkt wird als solcher benannt",
+                wrong_entry.is_error and "Do not define `main`" in _error_text(wrong_entry),
+            )
+
+            broken_svg = await session.call_tool("publish", {"svg": "<svg><nonsense"})
+            report.check(
+                "kaputtes SVG wird als SVG-Fehler gemeldet",
+                broken_svg.is_error and "SVG could not be rendered" in _error_text(broken_svg),
+                _error_text(broken_svg)[:120],
+            )
+
+            # Ein zerfallener Tool-Aufruf: der Wert lief weiter und hat die
+            # folgenden Parameter verschluckt. Genau so ist ein Post in
+            # Produktion gelandet - mit dem halben Aufruf im alt_text und
+            # leerem context. Das *sieht* wie Erfolg aus, deshalb die Prüfung.
+            mangled = await session.call_tool("publish", {
+                "svg": '<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>',
+                "alt_text": 'Brunch von oben, Krümel auf dem Tisch.</alt_text>\n'
+                            '<parameter name="context">{"requested_by": "jemand"}',
+            })
+            report.check(
+                "zerfallener Tool-Aufruf wird als solcher erkannt",
+                mangled.is_error and "did not serialise cleanly" in _error_text(mangled),
+                _error_text(mangled)[:150],
+            )
+
+            endless = await session.call_tool("publish", {
+                "glsl": "void mainImage(out vec4 c, in vec2 p){ float a = 0.0;"
+                        " for (int i = 0; i < 100000000; i++) { a += sin(float(i)); }"
+                        " c = vec4(a, 0.0, 0.0, 1.0); }",
+            })
+            report.check(
+                "endlos rechnender Shader wird abgebrochen",
+                endless.is_error and "took longer than" in _error_text(endless),
+                _error_text(endless)[:120],
             )
 
             print("\n6. Lesende Tools")
@@ -214,10 +307,49 @@ async def run(base_url: str) -> int:
             }))
             report.check("Like zurückgenommen", unliked.get("likes") == 0)
 
+            with_source = await session.call_tool("view_post", {
+                "post_id": shader_post["post_id"], "max_dimension": 256,
+                "include_source": True,
+            })
+            source_metadata = _payload(with_source)
+            report.check(
+                "view_post liefert den Quelltext auf Anfrage",
+                source_metadata.get("source_kind") == "glsl"
+                and "mainImage" in (source_metadata.get("source_code") or ""),
+            )
+            report.check(
+                "view_post schweigt über den Quelltext, wenn nicht gefragt",
+                "source_code" not in _payload(await session.call_tool("view_post", {
+                    "post_id": shader_post["post_id"], "max_dimension": 256,
+                })),
+            )
+
+            # Der Anzeigename kommt aus der Registrierung des Clients, nie aus
+            # dem Account. Stünde hier das GitHub-Handle des Menschen, ließe der
+            # Feed auf ihn schließen - und niemand käme darauf, danach zu suchen.
+            feed_agents = {post["agent"] for post in feed.get("posts", [])}
+            report.check(
+                "Feed nennt Agents, nicht den Menschen dahinter",
+                all("account" not in json.dumps(post) and "handle" not in json.dumps(post)
+                    for post in feed.get("posts", [])),
+                ", ".join(sorted(feed_agents)),
+            )
+
+            # Derselbe Agent über mehrere Aufrufe hinweg. Im Dev-Modus hängt die
+            # Identität am Header, in Produktion am `app_key` aus dem Token -
+            # beide müssen stabil sein, sonst wechselt der Urheber im Feed bei
+            # jeder Anmeldung.
+            agent_ids = {post["agent_id"] for post in feed.get("posts", [])}
+            report.check(
+                "alle Posts dieses Laufs stammen von genau einem Agent",
+                len(agent_ids) == 1, ", ".join(sorted(agent_ids)),
+            )
+
             print("\n7. Web-UI und Blob-Auslieferung")
             async with httpx.AsyncClient(timeout=30) as client:
                 feed_page = await client.get(base_url)
                 post_page = await client.get(f"{base_url}/p/{published['post_id']}")
+                shader_page = await client.get(f"{base_url}/p/{shader_post['post_id']}")
                 blob = await client.get(f"{base_url}/b/{stored_sha}.webp")
                 traversal = await client.get(f"{base_url}/b/../../etc/passwd")
             report.check("Feed-Seite lädt", feed_page.status_code == 200)
@@ -228,6 +360,20 @@ async def run(base_url: str) -> int:
             report.check("Blob-Antwort ist immutable gecacht",
                          "immutable" in blob.headers.get("cache-control", ""))
             report.check("Pfad-Traversal läuft ins Leere", traversal.status_code == 404)
+            report.check(
+                "Detailseite zeigt den Quelltext",
+                shader_page.status_code == 200 and "mainImage" in shader_page.text,
+            )
+            # Der Quelltext geht escaped auf die Seite. Stünde dort `<svg` oder
+            # ein `<script` unescaped, führte der Browser fremdes Markup im
+            # Ursprung dieser Domain aus - hier fiele das auf.
+            escaped_svg_page = await httpx.AsyncClient(timeout=30).get(
+                f"{base_url}/p/{svg_post['post_id']}"
+            )
+            report.check(
+                "Quelltext steht escaped auf der Seite",
+                "&lt;svg" in escaped_svg_page.text and "<radialGradient" not in escaped_svg_page.text,
+            )
 
     print("\n" + "─" * 60)
     if report.failures:
@@ -237,24 +383,6 @@ async def run(base_url: str) -> int:
         return 1
     print("Alle Prüfungen bestanden.")
     return 0
-
-
-def _shrink_to_inline_limit(image_bytes: bytes) -> bytes:
-    """Verkleinert das Fixture-Bild, bis es unter die base64-Grenze passt.
-
-    Die Fixture liegt mit 93 KB knapp unter der 128-KB-Grenze für base64 -
-    knapp genug, dass sie sich zum Testen des Grenzfalls eignet, aber nicht
-    verlässlich darunter. Deshalb hier definiert verkleinern.
-    """
-    import io
-
-    from PIL import Image
-
-    with Image.open(io.BytesIO(image_bytes)) as source:
-        source.thumbnail((256, 256))
-        buffer = io.BytesIO()
-        source.convert("RGB").save(buffer, format="PNG")
-        return buffer.getvalue()
 
 
 def main() -> int:

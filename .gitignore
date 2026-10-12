@@ -9,3 +9,7 @@ Claude outputs/
 # Betrieb
 *.log
 blobs/
+
+# Python-Bytecode aus lokalen Läufen (die App läuft im Container).
+__pycache__/
+*.py[cod]

@@ -13,12 +13,35 @@
       <dl>
         <dt>Likes</dt><dd>{{ post.likes }}</dd>
         <dt>Size</dt><dd>{{ post.width }} × {{ post.height }}</dd>
+        {% if post.source_kind %}
+          <dt>Made with</dt><dd>{{ post.source_kind | upper }}</dd>
+        {% endif %}
         <dt>Published</dt><dd>{{ post.created_at }}</dd>
         <dt>Post ID</dt><dd><code>{{ post.post_id }}</code></dd>
       </dl>
       <p class="back"><a href="/">← back to the feed</a></p>
     </div>
   </article>
+
+  {#
+    Der Quelltext ist bei einem gerenderten Werk das eigentliche Werk - das
+    Bild darüber ist eine Ansicht davon. Deshalb steht er auf der Seite.
+
+    Er steht als Text in einem <pre>, und das ist keine Formfrage: Jinja
+    escapet hier, und nur deshalb ist es sicher. Ein SVG in die Seite zu
+    inlinen oder unter `image/svg+xml` auszuliefern hieße, fremdes aktives
+    Markup - inklusive <script> - im Ursprung dieser Domain auszuführen.
+    Der Browser bekommt das Raster, der Leser den Quelltext.
+  #}
+  {% if post.source_code %}
+    <details class="source">
+      <summary>Source · {{ post.source_kind | upper }}, {{ post.source_code | length }} characters</summary>
+      <pre><code>{{ post.source_code }}</code></pre>
+      {% if post.source_params and post.source_params.time is defined %}
+        <p class="params">Rendered at iTime = {{ post.source_params.time }}</p>
+      {% endif %}
+    </details>
+  {% endif %}
 
   <style>
     .detail { display: grid; gap: 2rem; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); }
@@ -38,5 +61,19 @@
     .side dd { margin: 0; }
     .side code { font-size: .8rem; }
     .back a { color: var(--accent); font-size: .85rem; }
+    .source { margin-top: 2rem; border-top: 1px solid var(--border); padding-top: 1.5rem; }
+    .source summary {
+      cursor: pointer; color: var(--muted); font-size: .8rem;
+      text-transform: uppercase; letter-spacing: .1em;
+    }
+    .source summary:hover { color: var(--accent); }
+    .source pre {
+      margin: 1rem 0 0; padding: 1rem; background: var(--surface);
+      border: 1px solid var(--border); border-radius: var(--radius);
+      /* Langer Quelltext scrollt in seinem eigenen Kasten, statt die Seite
+         breiter zu machen als das Fenster. */
+      overflow-x: auto; font-size: .8rem; line-height: 1.5;
+    }
+    .source .params { color: var(--muted); font-size: .8rem; margin: .75rem 0 0; }
   </style>
 {% endblock %}

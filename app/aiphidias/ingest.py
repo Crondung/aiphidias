@@ -1,8 +1,14 @@
-"""Der eine Weg, auf dem Bytes zu einem gespeicherten Bild werden.
+"""Der eine Weg, auf dem ein Bild in die Ablage kommt.
 
-Alle drei Bytequellen aus `publish` (Upload-Token, source_url, inline_base64)
-münden hier - damit Deckelung, Re-Encoding und Deduplizierung an genau einer
-Stelle passieren und nicht dreimal leicht unterschiedlich.
+Zwei Eingänge, ein Weg. `store_image_bytes` nimmt fremde Bytes entgegen - aus
+`source_url` oder aus einem eingelösten Upload-Token - und prüft sie
+entsprechend misstrauisch. `store_rendered_image` nimmt, was `rendering/` aus
+Quelltext erzeugt hat, und lässt die Prüfungen weg, die dort gegenstandslos
+wären.
+
+Ab `_persist` laufen beide durch denselben Code. Genau darum geht es: Ablage,
+Thumbnail und Deduplizierung existieren einmal und nicht zweimal leicht
+unterschiedlich.
 """
 
 import logging
@@ -77,6 +83,38 @@ async def store_image_bytes(
             )
 
     encoded = encode_for_storage(raw, settings)
+    return await _persist(conn, encoded, blob_store=blob_store, settings=settings)
+
+
+async def store_rendered_image(
+    conn: asyncpg.Connection,
+    encoded: EncodedImage,
+    *,
+    blob_store: BlobStore,
+    settings: Settings,
+) -> StoredImage:
+    """Legt ein Bild ab, das der Server selbst gerendert hat.
+
+    Der zweite Eingang neben `store_image_bytes` - ab `_persist` läuft beides
+    durch denselben Code, damit Ablage, Thumbnail und Deduplizierung genau
+    einmal existieren.
+
+    Was hier fehlt, fehlt mit Absicht: keine Formatprüfung, keine Größengrenze,
+    kein Bomb-Schutz. Diese Prüfungen richten sich gegen fremde Bytes. Hier ist
+    das Bild in `rendering/` entstanden, in einem Prozess mit Zeit- und
+    Speichergrenze, in einer Größe, die wir selbst vorgegeben haben.
+
+    Args:
+        conn: Offene Verbindung für den `blobs`-Eintrag.
+        encoded: Das fertig encodierte Bild aus dem Renderer.
+        blob_store: Zielablage.
+        settings: Grenzwerte für das Thumbnail.
+
+    Returns:
+        Beschreibung des gespeicherten Bildes. `deduplicated` ist wahr, wenn
+        derselbe Quelltext schon einmal dasselbe Bild ergeben hat - das Rendern
+        ist deterministisch, deshalb greift die Deduplizierung auch hier.
+    """
     return await _persist(conn, encoded, blob_store=blob_store, settings=settings)
 
 

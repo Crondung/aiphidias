@@ -224,12 +224,56 @@ async def _accept(
         grant_scope=consent_request.get("requested_scope", []),
         audience=[resource],
         session={
-            # Landet als Claim im Access-Token. Der Resource Server liest
-            # daraus nichts Sicherheitsrelevantes - `sub` und `client_id`
-            # kommen aus dem Token selbst -, aber es hilft beim Debuggen.
-            "access_token": {"aiphidias": {"granted_resource": resource}},
+            # Landet als Claim im Access-Token. `granted_resource` hilft beim
+            # Debuggen; `app_key` und `client_name` trägt der Resource Server
+            # dagegen als Agent-Identität weiter - siehe `_app_key`.
+            "access_token": {
+                "aiphidias": {
+                    "granted_resource": resource,
+                    "app_key": _app_key(consent_request),
+                    "client_name": _client_label(consent_request),
+                }
+            },
         },
     )
+
+
+def _app_key(consent_request: dict) -> str:
+    """Bildet einen über Neuregistrierungen hinweg stabilen Schlüssel für die Anwendung.
+
+    **Das Problem, das diese Funktion löst.** Bei Dynamic Client Registration
+    vergibt Hydra bei *jeder* Registrierung eine neue `client_id`. Ein Connector
+    registriert sich aber bei jeder Neuanmeldung erneut. Gemessen auf dem
+    Server: neun `client_id`s, alle mit `client_name: "Claude"` und derselben
+    Redirect-URI - also neunmal dasselbe Programm. Wer die `client_id` als
+    Agent-Identität nimmt, bekommt bei jeder Anmeldung einen neuen Agent mit
+    einem neuen Namen, obwohl sich nichts geändert hat.
+
+    Stabil ist stattdessen, *was* sich da anmeldet: Name plus Herkunft der
+    Redirect-URI. Beides steht schon in der Registrierung.
+
+    Der Schlüssel wird immer zusammen mit der `account_id` verwendet und ist
+    deshalb pro Mensch eindeutig. Dass ein Client seinen Namen selbst wählt, ist
+    darum unkritisch: er kann höchstens *seine eigenen* früheren Posts erben.
+
+    Args:
+        consent_request: Der Consent-Request aus Hydras Admin-API.
+
+    Returns:
+        Ein stabiler Schlüssel. Fällt auf die `client_id` zurück, wenn eine
+        Registrierung weder Namen noch Redirect-URI mitbringt - dann verhält
+        sich alles wie vorher, statt alle namenlosen Clients zu verschmelzen.
+    """
+    client = consent_request.get("client", {})
+    name = " ".join((client.get("client_name") or "").split()).casefold()
+
+    redirects = client.get("redirect_uris") or []
+    parsed = urlparse(redirects[0]) if redirects else None
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed and parsed.netloc else ""
+
+    if not name and not origin:
+        return f"client:{client.get('client_id', '')}"
+    return f"app:{origin}|{name}"
 
 
 def _requested_resource(consent_request: dict) -> str | None:
@@ -252,10 +296,30 @@ def _requested_resource(consent_request: dict) -> str | None:
     return values[0] if len(values) == 1 else None
 
 
+# Anzeigenamen werden von Menschen im Feed und auf der Einwilligungsseite
+# gelesen, sind also nach der Sprachregel englisch - und kommen aus einer
+# Registrierung, die sich der Client selbst ausgesucht hat. Deshalb gedeckelt
+# und von Steuerzeichen befreit, bevor sie irgendwo landen.
+_MAX_CLIENT_NAME_CHARS = 60
+_UNNAMED_CLIENT = "An unnamed client"
+
+
 def _client_label(consent_request: dict) -> str:
-    """Findet einen anzeigbaren Namen für den anfragenden Client."""
-    client = consent_request.get("client", {})
-    return client.get("client_name") or client.get("client_id", "Ein unbenannter Client")
+    """Findet einen anzeigbaren Namen für den anfragenden Client.
+
+    Der Wert erscheint auf der Einwilligungsseite **und** als Urheber im Feed.
+    Er stammt aus der Client-Registrierung, ist also nicht vertrauenswürdig:
+    Zeilenumbrüche und Steuerzeichen fliegen raus, die Länge ist gedeckelt.
+
+    Args:
+        consent_request: Der Consent-Request aus Hydras Admin-API.
+
+    Returns:
+        Ein kurzer, einzeiliger Name.
+    """
+    raw = consent_request.get("client", {}).get("client_name") or ""
+    printable = "".join(character for character in raw if character.isprintable())
+    return " ".join(printable.split())[:_MAX_CLIENT_NAME_CHARS].strip() or _UNNAMED_CLIENT
 
 
 def _problem(templates: Jinja2Templates, request: Request, message: str) -> HTMLResponse:
