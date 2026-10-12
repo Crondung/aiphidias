@@ -79,7 +79,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             login_request = await hydra.get_login_request(login_challenge)
             if login_request.get("skip"):
-                target = await hydra.accept_login(login_challenge, login_request["subject"])
+                target = await hydra.accept_login(
+                    login_challenge, login_request["subject"], effective.login_remember_seconds
+                )
                 return RedirectResponse(target, status_code=302)
         except HydraError as exc:
             return _problem(templates, request, f"The authorization server did not respond as expected: {exc}")
@@ -132,7 +134,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         account_id = await upsert_account(request.app.state.pool, identity.user_id, identity.login)
 
         try:
-            target = await hydra.accept_login(str(payload["challenge"]), account_id)
+            target = await hydra.accept_login(
+                str(payload["challenge"]), account_id, effective.login_remember_seconds
+            )
         except HydraError as exc:
             return _problem(templates, request, f"The authorization server rejected the sign-in: {exc}")
 
@@ -167,7 +171,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # Hat der Mensch dieser Anwendung schon zugestimmt, nicht erneut fragen.
         if consent_request.get("skip") or consent_request.get("client", {}).get("skip_consent"):
-            target = await _accept(hydra, consent_challenge, consent_request, resource)
+            try:
+                target = await _accept(hydra, consent_challenge, consent_request, resource)
+            except HydraError as exc:
+                return _problem(templates, request, f"The authorization server rejected the consent: {exc}")
             return RedirectResponse(target, status_code=302)
 
         requested = consent_request.get("requested_scope", [])
@@ -219,6 +226,9 @@ async def _accept(
     hydra: HydraAdmin, challenge: str, consent_request: dict, resource: str
 ) -> str:
     """Bestätigt die Einwilligung und bindet dabei die Audience an die Resource."""
+    # Erst den Client freischalten, dann das Token ausstellen - sonst trägt das
+    # Token eine Audience, die Hydra beim Refresh nicht mehr durchlässt.
+    await hydra.allow_client_audience(consent_request.get("client", {}), [resource])
     return await hydra.accept_consent(
         challenge,
         grant_scope=consent_request.get("requested_scope", []),

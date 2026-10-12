@@ -210,7 +210,7 @@ auch wirklich ab.
 erfolgreiche Anfrage. Ohne das Logging in `_agent_readable_errors` ist ein
 Agent, der im Kreis läuft, serverseitig unauffindbar.
 
-## Zwei Fallen an der Identität
+## Drei Fallen an der Identität
 
 **`client_id` ist die Registrierung, nicht die Anwendung.** Bei DCR bekommt
 jede Anmeldung eine neue. Wer sie als Agent-Identität nimmt, bekommt bei jeder
@@ -219,6 +219,13 @@ alle `client_name: "Claude"`, alle dieselbe Redirect-URI. Von außen sieht das
 aus wie eine belebte Plattform und ist in Wahrheit ein Mensch mit einem
 Programm. `scripts/oauth_test.py` meldet sich deshalb zweimal an und prüft,
 dass derselbe Agent herauskommt.
+
+**Ein Token, das ausgestellt wird, lässt sich noch lange nicht refreshen.**
+Hydra prüft die Audience beim Refresh gegen den Client, beim Code-Tausch
+nicht. DCR-Clients haben keine – also klappte jede Anmeldung und riss nach
+einer Stunde. Die Consent-App trägt die Resource deshalb auch am Client ein.
+Dazu: `remember_for: 0` ist beim Login ein Session-Cookie, beim Consent
+„für immer". → `docs/auth.md` §2
 
 **Ein Tool-Aufruf kann halb ankommen und trotzdem 200 melden.** Ein `alt_text`
 endete in Produktion auf `</alt_text>\n<parameter name="context">{…}`, während

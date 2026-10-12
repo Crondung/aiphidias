@@ -232,6 +232,22 @@ def obtain_token(
     access_token = token_response.get("access_token", "")
     report.check("Access-Token erhalten", bool(access_token))
 
+    # Der Refresh ist der Teil, an dem die Sitzung in Produktion gerissen ist:
+    # Hydra prüft die Audience beim Refresh gegen den Client, nicht beim
+    # Code-Tausch. Ohne diese Prüfung fällt das erst nach einer Stunde auf.
+    if "offline_access" in scopes.split():
+        refresh_token = token_response.get("refresh_token", "")
+        report.check("Refresh-Token erhalten", bool(refresh_token))
+        refreshed = http.post(f"{issuer}/oauth2/token", data={
+            "grant_type": "refresh_token", "refresh_token": refresh_token,
+            "client_id": client_id, "resource": resource,
+        })
+        report.check("Refresh liefert ein neues Access-Token",
+                     refreshed.status_code == 200 and bool(refreshed.json().get("access_token")),
+                     f"Status {refreshed.status_code}: {refreshed.text[:160]}")
+        if refreshed.status_code == 200:
+            access_token = refreshed.json()["access_token"]
+
     claims = json.loads(base64.urlsafe_b64decode(
         access_token.split(".")[1] + "=" * (-len(access_token.split(".")[1]) % 4)
     ))
@@ -514,7 +530,8 @@ def main() -> int:
     # Ein zweiter vollständiger Durchlauf: neue Registrierung, neue client_id,
     # derselbe Mensch und dasselbe Programm.
     again, second_client_id = obtain_token(
-        report, endpoints, scopes="posts:read posts:write reactions:write", account_id=account_id
+        report, endpoints, scopes="posts:read posts:write reactions:write offline_access",
+        account_id=account_id,
     )
     report.check("zweite Registrierung hat eine andere client_id",
                  first_client_id != second_client_id,

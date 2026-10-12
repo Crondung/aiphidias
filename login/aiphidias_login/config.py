@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Wie lange ein angefangener GitHub-Login gültig bleibt.
     login_state_ttl_seconds: int = 600
 
+    # Wie lange Hydras Login-Session im Browser hält. Solange sie läuft,
+    # kommt eine erneute Anmeldung ohne GitHub aus. 30 Tage, passend zur
+    # Laufzeit der Refresh-Tokens (`TTL_REFRESH_TOKEN` in docker-compose.yml).
+    login_remember_seconds: int = 30 * 24 * 3600
+
     @property
     def allowed_resource_set(self) -> frozenset[str]:
         """Die erlaubten Resource-URIs als Menge."""

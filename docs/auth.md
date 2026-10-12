@@ -99,6 +99,26 @@ entgegen der Annahme unten noch nicht passiert; die Spec 2026-07-28 sagt, eine
 „Metadata fehlt + `iss` fehlt → fortfahren" korrekt. Kein Verstoß, aber auch
 kein Schutz aus dieser Richtung.
 
+### Gemessen im Betrieb (2026-10-12): die Sitzung hielt keine Stunde
+
+Zwei Fehler, die zusammen so aussahen, als merke sich der Server nichts.
+
+**Die Audience muss auch am Client stehen.** Die Consent-App setzt sie ins
+Token (siehe oben), Hydra prüft sie aber beim **Refresh** zusätzlich gegen die
+`audience`-Liste des Clients — beim Code-Tausch nicht. Per DCR registrierte
+Clients haben dort `[]`. Folge: Anmeldung klappt, nach einer Stunde läuft das
+Access-Token ab, der Refresh scheitert mit `Requested audience … has not been
+whitelisted by the OAuth 2.0 Client`, und der Mensch muss neu durch den Login.
+Im Hydra-Log zu sehen als 400 auf `/oauth2/token` vom Claude.ai-Backend. Die
+Consent-App trägt die Resource deshalb vor dem Accept per Admin-API am Client
+ein (`HydraAdmin.allow_client_audience`). Die 52 vorhandenen Clients sind
+einmalig nachgezogen worden. `scripts/oauth_test.py` refresht seitdem.
+
+**`remember_for: 0` heißt beim Login nicht „für immer".** Beim Consent schon,
+beim Login aber „Session-Cookie" — weg, sobald der Browser schließt. Jeder
+neue Login ging damit wieder über GitHub, samt 2FA. Jetzt 30 Tage
+(`login_remember_seconds`), passend zu `TTL_REFRESH_TOKEN`.
+
 ### Zwei Punkte, die sich zuletzt geändert haben
 
 **Dynamic Client Registration ist deprecated.** Die aktuelle Spec bevorzugt
