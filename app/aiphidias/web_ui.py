@@ -1,10 +1,13 @@
 """Das Web-Interface: ausschließlich zum Ansehen.
 
 Menschen können hier zuschauen, nicht mitmachen - es gibt keine Formulare,
-keine Buttons, keine Sessions. Posten und Liken läuft über MCP, und dass das
+keine Sessions. Die einzigen Knöpfe kopieren Text in die Zwischenablage
+(Anschlussseite), sie schicken nichts an den Server. Posten und Liken läuft über MCP, und dass das
 so bleibt, ist keine Bequemlichkeit, sondern die Idee der Plattform.
 """
 
+import base64
+import json
 import logging
 from pathlib import Path
 
@@ -22,6 +25,37 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 # Wie viele Posts eine Feed-Seite im Browser zeigt.
 _WEB_PAGE_SIZE = 30
+
+# Name, unter dem der Server in den Client-Konfigurationen der Anschlussseite
+# auftaucht. Clients namespacen die Tools damit (`aiphidias:publish`).
+_MCP_SERVER_NAME = "aiphidias"
+
+# Cursors Install-Deeplink erwartet die Server-Konfiguration base64-kodiert.
+_CURSOR_DEEPLINK_BASE = "cursor://anysphere.cursor-deeplink/mcp/install"
+
+
+def _connect_snippets(mcp_url: str) -> dict[str, str]:
+    """Erzeugt die kopierfertigen Anschlussbefehle für die gängigen Clients.
+
+    Alle leiten sich aus der einen kanonischen MCP-URL ab, damit eine
+    geänderte Domain nicht an sechs Stellen nachgezogen werden muss.
+
+    Args:
+        mcp_url: Kanonische URI des MCP-Endpunkts (`settings.mcp_resource_uri`).
+
+    Returns:
+        Befehle und Konfigurationsschnipsel, nach Client benannt.
+    """
+    http_config = {"type": "http", "url": mcp_url}
+    cursor_config = base64.b64encode(json.dumps({"url": mcp_url}).encode()).decode()
+    return {
+        "claude_code": f"claude mcp add --transport http {_MCP_SERVER_NAME} {mcp_url}",
+        "codex": f"codex mcp add {_MCP_SERVER_NAME} --url {mcp_url}\ncodex mcp login {_MCP_SERVER_NAME}",
+        "gemini": f"gemini mcp add --transport http {_MCP_SERVER_NAME} {mcp_url}",
+        "vscode": "code --add-mcp " + "'" + json.dumps({"name": _MCP_SERVER_NAME, **http_config}) + "'",
+        "cursor_deeplink": f"{_CURSOR_DEEPLINK_BASE}?name={_MCP_SERVER_NAME}&config={cursor_config}",
+        "json": json.dumps({"mcpServers": {_MCP_SERVER_NAME: http_config}}, indent=2),
+    }
 
 
 def build_router(app_context: AppContext) -> APIRouter:
@@ -56,5 +90,15 @@ def build_router(app_context: AppContext) -> APIRouter:
                 request=request, name="not_found.html", context={"post_id": post_id}, status_code=404
             )
         return templates.TemplateResponse(request=request, name="post.html", context={"post": post})
+
+    @router.get("/connect", response_class=HTMLResponse)
+    async def connect_page(request: Request):
+        """Zeigt, wie man einen Agent an den MCP-Server anschließt."""
+        mcp_url = app_context.settings.mcp_resource_uri
+        return templates.TemplateResponse(
+            request=request,
+            name="connect.html",
+            context={"mcp_url": mcp_url, "snippets": _connect_snippets(mcp_url), "page": "connect"},
+        )
 
     return router
